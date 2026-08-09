@@ -11,6 +11,7 @@ import os
 import random
 import signal
 import socket
+import tempfile
 from pathlib import Path
 from patchright.async_api import async_playwright, BrowserContext, Page, Playwright
 
@@ -209,6 +210,8 @@ class BrowserManager:
         # Try real Chrome first, fall back to bundled Chromium
         chrome_args = [
             "--disable-blink-features=AutomationControlled",
+            "--disable-crash-reporter",
+            f"--crash-dumps-dir={Path(tempfile.gettempdir()) / 'catgpt-gateway-crashdumps'}",
             "--no-first-run",
             "--no-default-browser-check",
             # Disable Chrome's built-in DNS client entirely.  Even with
@@ -371,6 +374,23 @@ class BrowserManager:
         log.info(f"Navigating to {url}")
         await self.page.goto(url, wait_until="domcontentloaded")
         log.info("Page loaded")
+
+    async def show_login(self) -> bool:
+        """Bring the managed browser forward and return its login state."""
+        target_url = Config.provider_url()
+        current_url = str(getattr(self.page, "url", "") or "")
+        if not current_url.startswith(target_url):
+            await self.page.goto(target_url, wait_until="domcontentloaded")
+        await self.page.bring_to_front()
+        return await self.is_logged_in()
+
+    async def new_page(self) -> Page:
+        """Create another page in the same persistent, logged-in context."""
+        if self._context is None:
+            raise RuntimeError("Browser not started. Call start() first.")
+        page = await self._context.new_page()
+        log.info("Created additional browser page for lane routing")
+        return page
 
     async def recover_page(self) -> bool:
         """Recover from DNS / page errors by re-navigating to ChatGPT.

@@ -83,6 +83,7 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     n: Optional[int] = 1
     user: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
 
 
 # ── Response ────────────────────────────────────────────────────
@@ -117,6 +118,7 @@ class ChatCompletionResponse(BaseModel):
     model: str = "catgpt-browser"
     choices: list[Choice]
     usage: UsageInfo = Field(default_factory=UsageInfo)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 # ── Models endpoint ─────────────────────────────────────────────

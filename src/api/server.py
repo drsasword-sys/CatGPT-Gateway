@@ -21,12 +21,12 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from src.browser.manager import BrowserManager
-from src.browser.auto_login import ensure_logged_in
 from src.chatgpt.client import ChatGPTClient
+from src.chatgpt.lane_pool import ChatGPTLanePool
 from src.claude.client import ClaudeClient
 from src.config import Config
 from src.api.routes import router, set_client
-from src.api.openai_routes import openai_router, set_openai_client
+from src.api.openai_routes import openai_router, set_lane_pool, set_openai_client
 from src.log import setup_logging
 
 log = setup_logging("api_server")
@@ -34,12 +34,13 @@ log = setup_logging("api_server")
 # Global instances — needed for lifespan
 _browser: BrowserManager | None = None
 _client: ChatGPTClient | ClaudeClient | None = None
+_lane_pool: ChatGPTLanePool | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: launch browser. Shutdown: close it."""
-    global _browser, _client
+    global _browser, _client, _lane_pool
 
     log.info("Starting browser for API server...")
     _browser = BrowserManager()
@@ -72,12 +73,12 @@ async def lifespan(app: FastAPI):
 
     await asyncio.sleep(3)
 
-    if not await _browser.is_logged_in():
-        log.info("Not logged in — starting auto-login flow...")
-        logged_in = await ensure_logged_in(_browser)
-        if not logged_in:
-            log.error(f"Login failed after auto-login attempt")
-            raise RuntimeError(f"Could not log in to {provider_name}")
+    logged_in = await _browser.is_logged_in()
+    if not logged_in:
+        # A distributable sidecar must start even before first login. The API
+        # remains reachable and /status reports logged_in=false while the
+        # user completes authentication in the visible managed browser.
+        log.warning("%s login required — API starting in recovery mode", provider_name)
 
     if Config.PROVIDER == "claude":
         _client = ClaudeClient(page)
@@ -86,11 +87,29 @@ async def lifespan(app: FastAPI):
 
     set_client(_client, _browser)
     set_openai_client(_client)
-    log.info(f"API server ready — browser launched, logged in to {provider_name}")
+    if Config.PROVIDER == "chatgpt":
+        _lane_pool = ChatGPTLanePool(
+            _browser,
+            _client,
+            lane_count=Config.LANE_COUNT,
+            max_concurrency=Config.MAX_CONCURRENCY,
+        )
+        set_lane_pool(_lane_pool)
+    log.info(
+        "API server ready — browser launched, provider=%s, logged_in=%s, lanes=%s, concurrency=%s",
+        provider_name,
+        logged_in,
+        Config.LANE_COUNT,
+        Config.MAX_CONCURRENCY,
+    )
 
     yield  # Server is running
 
     log.info("Shutting down — closing browser...")
+    if _lane_pool is not None:
+        await _lane_pool.close()
+        _lane_pool = None
+        set_lane_pool(None)
     await _browser.close()
     log.info("Browser closed")
 
@@ -187,7 +206,7 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
-        "src.api.server:app",
+        app,
         host=Config.API_HOST,
         port=Config.API_PORT,
         log_level="info",

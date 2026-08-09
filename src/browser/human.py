@@ -35,7 +35,15 @@ async def human_type(page: Page, selector: str, text: str) -> None:
     Falls back to clipboard paste, then keyboard.insert_text().
     """
     element = page.locator(selector).first
-    await element.click()
+    try:
+        await element.click()
+    except Exception as exc:
+        # On a resumed conversation the composer can be visually covered by
+        # the previous turn while the SPA finishes settling. Focusing the
+        # contenteditable still lets the DOM insertion path below fire the
+        # same input events without weakening response/marker validation.
+        log.debug("Click on input was blocked; focusing element directly: %s", exc)
+        await element.focus()
     await asyncio.sleep(random.uniform(0.1, 0.25))
 
     # Clear any stale text in the input before inserting new text

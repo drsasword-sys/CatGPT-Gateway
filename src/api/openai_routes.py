@@ -45,6 +45,7 @@ from src.api.openai_schemas import (
     UsageInfo,
 )
 from src.chatgpt.client import ChatGPTClient
+from src.chatgpt.lane_pool import ChatGPTLanePool
 from src.claude.client import ClaudeClient
 from src.config import Config
 from src.log import setup_logging
@@ -55,6 +56,7 @@ openai_router = APIRouter()
 
 # Global reference — set by server.py at startup
 _client: ChatGPTClient | ClaudeClient | None = None
+_lane_pool: ChatGPTLanePool | None = None
 
 # Serialize all requests — single browser page, not thread-safe.
 # Created lazily to avoid Python 3.9 event-loop binding issues.
@@ -134,6 +136,12 @@ def set_openai_client(client: ChatGPTClient | ClaudeClient) -> None:
     """Called by server.py to inject the client."""
     global _client
     _client = client
+
+
+def set_lane_pool(pool: ChatGPTLanePool | None) -> None:
+    """Inject the optional ChatGPT Project lane pool from server startup."""
+    global _lane_pool
+    _lane_pool = pool
 
 
 def _get_client() -> ChatGPTClient | ClaudeClient:
@@ -761,6 +769,73 @@ async def create_chat_completion(
         raise HTTPException(status_code=400, detail="messages array cannot be empty")
 
     client = _get_client()
+
+    metadata = request.metadata or {}
+    lane_value = metadata.get("lane")
+    use_lane = Config.PROVIDER == "chatgpt" and _lane_pool is not None and lane_value is not None
+
+    if use_lane:
+        try:
+            lane_number = int(lane_value)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="metadata.lane must be an integer") from exc
+        project_ref = str(metadata.get("project_ref") or "")
+        chat_ref = str(metadata.get("chat_ref") or "")
+        lane_count = metadata.get("lane_count")
+        try:
+            lane_count = int(lane_count) if lane_count is not None else None
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="metadata.lane_count must be an integer") from exc
+
+        messages = list(request.messages)
+        has_tool_prompt = False
+        if request.tools and request.tool_choice != "none":
+            messages.insert(0, ChatMessage(role="system", content=_build_tool_system_prompt(request.tools, tool_choice=request.tool_choice)))
+            has_tool_prompt = True
+        prompt = _build_prompt(messages)
+        image_paths: list[str] = []
+        file_paths: list[str] = []
+        for msg in request.messages:
+            if msg.role == "user" and isinstance(msg.content, list):
+                for url in _extract_image_urls(msg.content):
+                    local_path = await _download_file(url)
+                    if local_path:
+                        image_paths.append(local_path)
+                for attachment in _extract_file_attachments(msg.content):
+                    local_path = await _download_file(attachment)
+                    if local_path:
+                        file_paths.append(local_path)
+        try:
+            result = await _lane_pool.send(
+                lane_number,
+                prompt,
+                project_ref=project_ref,
+                chat_ref=chat_ref,
+                lane_count=lane_count,
+                image_paths=image_paths or None,
+                file_paths=file_paths or None,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            log.error("Lane provider error: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Provider error: {exc}") from exc
+
+        response_text = result.message
+        tool_calls = _parse_tool_calls(response_text, request.tools) if has_tool_prompt and request.tools else None
+        finish_reason = "tool_calls" if tool_calls else "stop"
+        if tool_calls:
+            response_text = None
+        return ChatCompletionResponse(
+            model=request.model,
+            choices=[Choice(index=0, message=ChoiceMessage(role="assistant", content=response_text, tool_calls=tool_calls), finish_reason=finish_reason)],
+            usage=UsageInfo(
+                prompt_tokens=_estimate_tokens(prompt),
+                completion_tokens=_estimate_tokens(response_text or ""),
+                total_tokens=_estimate_tokens(prompt) + _estimate_tokens(response_text or ""),
+            ),
+            metadata={"lane": lane_number, "thread_id": result.thread_id},
+        )
 
     async with _get_lock():
         start_time = time.time()

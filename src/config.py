@@ -25,14 +25,38 @@ load_dotenv(_CWD / ".env")
 load_dotenv(_PROJECT_ROOT / ".env")
 
 
+def _runtime_path(env_name: str, fallback: Path) -> Path:
+    """Resolve an optional absolute/relative runtime directory safely."""
+    configured = os.getenv(env_name, "").strip()
+    if not configured:
+        return fallback
+    candidate = Path(configured).expanduser()
+    return candidate if candidate.is_absolute() else _PROJECT_ROOT / candidate
+
+
+_NATIVE_SIDECAR = os.getenv("NATIVE_SIDECAR", "false").lower() == "true"
+_LOCAL_APP_DATA = Path(os.getenv("LOCALAPPDATA", str(_PROJECT_ROOT)))
+_NATIVE_DATA_ROOT = _LOCAL_APP_DATA / "AppStran" / "CatGPT"
+
+
 class Config:
     """All project settings in one place."""
 
     # Paths
     PROJECT_ROOT: Path = _PROJECT_ROOT
-    BROWSER_DATA_DIR: Path = _PROJECT_ROOT / os.getenv("BROWSER_DATA_DIR", "browser_data")
-    LOG_DIR: Path = _PROJECT_ROOT / os.getenv("LOG_DIR", "logs")
-    IMAGES_DIR: Path = _PROJECT_ROOT / os.getenv("IMAGES_DIR", "downloads/images")
+    NATIVE_SIDECAR: bool = _NATIVE_SIDECAR
+    BROWSER_DATA_DIR: Path = _runtime_path(
+        "BROWSER_DATA_DIR",
+        (_NATIVE_DATA_ROOT / "browser-profile") if _NATIVE_SIDECAR else (_PROJECT_ROOT / "browser_data"),
+    )
+    LOG_DIR: Path = _runtime_path(
+        "LOG_DIR",
+        (_NATIVE_DATA_ROOT / "logs") if _NATIVE_SIDECAR else (_PROJECT_ROOT / "logs"),
+    )
+    IMAGES_DIR: Path = _runtime_path(
+        "IMAGES_DIR",
+        (_NATIVE_DATA_ROOT / "downloads" / "images") if _NATIVE_SIDECAR else (_PROJECT_ROOT / "downloads/images"),
+    )
 
     # Browser
     HEADLESS: bool = os.getenv("HEADLESS", "false").lower() == "true"
@@ -61,16 +85,25 @@ class Config:
     THINKING_PAUSE_MAX: int = int(os.getenv("THINKING_PAUSE_MAX", "1500"))
     # Completion poll interval — how often to check if response is ready (ms)
     POLL_INTERVAL_MS: int = int(os.getenv("POLL_INTERVAL_MS", "300"))
+    # ChatGPT Web rate-limits bursts of sidebar/project navigation. Lane
+    # pages remain concurrent for generation, but their initial UI setup is
+    # deliberately staggered.
+    LANE_BOOTSTRAP_GAP_SECONDS: float = float(os.getenv("LANE_BOOTSTRAP_GAP_SECONDS", "5"))
 
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "DEBUG")
     VERBOSE: bool = os.getenv("VERBOSE", "true").lower() == "true"
 
     # API (Phase 3)
-    API_HOST: str = os.getenv("API_HOST", "0.0.0.0")
+    API_HOST: str = os.getenv("API_HOST", "127.0.0.1")
     API_PORT: int = int(os.getenv("API_PORT", "8000"))
     RATE_LIMIT_SECONDS: int = int(os.getenv("RATE_LIMIT_SECONDS", "5"))
     API_TOKEN: str = os.getenv("API_TOKEN", "")  # Bearer token for API auth (empty = no auth)
+    LANE_COUNT: int = max(1, min(10, int(os.getenv("CATGPT_LANE_COUNT", "2"))))
+    MAX_CONCURRENCY: int = max(
+        1,
+        min(LANE_COUNT, int(os.getenv("CATGPT_MAX_CONCURRENCY", str(LANE_COUNT)))),
+    )
 
     # VNC
     VNC_PASSWORD: str = os.getenv("VNC_PASSWORD", "catgpt")

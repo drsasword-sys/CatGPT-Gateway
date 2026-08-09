@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from urllib.parse import urlparse
 
 from patchright.async_api import Page
 
@@ -383,6 +384,9 @@ class ChatGPTClient:
                     if (body.includes('ERR_CONNECTION_REFUSED')) return 'ERR_CONNECTION_REFUSED';
                     if (body.includes('ERR_INTERNET_DISCONNECTED')) return 'ERR_INTERNET_DISCONNECTED';
                     if (body.includes('ERR_CONNECTION_TIMED_OUT')) return 'ERR_CONNECTION_TIMED_OUT';
+                    if (body.includes('Too many requests') ||
+                        body.includes('temporarily limited access to your conversations'))
+                        return 'conversation_history_rate_limit';
                     if (title.includes("can't be reached") || title.includes("is not available"))
                         return 'page_unreachable';
                     if (body.includes('Something went wrong')) return 'ChatGPT_error';
@@ -400,6 +404,36 @@ class ChatGPTClient:
         await self._page.goto(url, wait_until="domcontentloaded")
         await random_delay(800, 1500)
         log.info(f"Thread {thread_id} loaded")
+
+    async def navigate_to_project(self, project_ref: str) -> None:
+        """Open a ChatGPT Project page before creating or continuing a chat.
+
+        ``project_ref`` is normally the URL returned by the Project UI.  A
+        full URL is preferred because ChatGPT has changed project URL shapes
+        over time; the gateway intentionally does not guess a private API ID.
+        """
+        value = str(project_ref or "").strip()
+        if not value:
+            raise ValueError("project_ref is required")
+        if value.startswith("/"):
+            url = f"{Config.CHATGPT_URL.rstrip('/')}{value}"
+        elif value.startswith(("http://", "https://")):
+            url = value
+        else:
+            url = f"{Config.CHATGPT_URL.rstrip('/')}/{value.lstrip('/')}"
+        parsed = urlparse(url)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "chatgpt.com"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port is not None
+        ):
+            raise ValueError("project_ref must be an HTTPS chatgpt.com URL")
+        log.info(f"Navigating to ChatGPT Project: {url}")
+        await self._page.goto(url, wait_until="domcontentloaded")
+        await random_delay(800, 1500)
+        await self._wait_for_chat_input()
 
     async def get_current_thread_url(self) -> str:
         """Get the current page URL (contains thread ID if in a conversation)."""

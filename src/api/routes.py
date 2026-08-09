@@ -12,6 +12,12 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import re
+import tempfile
+from pathlib import Path
+from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
 
@@ -20,13 +26,18 @@ from src.api.schemas import (
     ChatResponse,
     ImageInfoResponse,
     StatusResponse,
+    ControlResponse,
     ThreadInfo,
     ThreadListResponse,
+    ProjectCreateRequest,
+    ProjectCreateResponse,
 )
 from src.browser.manager import BrowserManager
 from src.chatgpt.client import ChatGPTClient
+from src.chatgpt.project_client import ChatGPTProjectClient, ProjectSetupError
 from src.claude.client import ClaudeClient
 from src.log import setup_logging
+from src.config import Config
 
 log = setup_logging("api_routes")
 
@@ -149,6 +160,48 @@ async def list_threads() -> ThreadListResponse:
             raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/projects", response_model=ProjectCreateResponse)
+async def create_project(req: ProjectCreateRequest) -> ProjectCreateResponse:
+    """Create a ChatGPT Web Project and optionally seed its visible context."""
+    if Config.PROVIDER == "claude":
+        raise HTTPException(status_code=501, detail="Projects are available only for ChatGPT Web")
+    client = _get_client()
+    upload_paths: list[str] = []
+    async with _lock:
+        try:
+            upload_dir = Path(tempfile.gettempdir()) / "catgpt-project-files"
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            for file_info in req.files[:25]:
+                filename = re.sub(r"[^A-Za-z0-9._-]", "_", str(file_info.get("filename") or "reference.txt"))
+                encoded = file_info.get("data")
+                if not encoded:
+                    continue
+                if len(str(encoded)) > 15 * 1024 * 1024:
+                    raise ValueError("Project file payload is too large")
+                path = upload_dir / f"{uuid4().hex}_{filename}"
+                path.write_bytes(base64.b64decode(str(encoded), validate=True))
+                upload_paths.append(str(path))
+            result = await ChatGPTProjectClient(client).create_project(
+                req.name,
+                instructions=req.instructions,
+                file_paths=upload_paths,
+            )
+            return ProjectCreateResponse(project_ref=result.project_ref, warnings=list(result.warnings))
+        except ProjectSetupError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except (ValueError, binascii.Error) as exc:
+            raise HTTPException(status_code=400, detail="Invalid Project file payload") from exc
+        except Exception as exc:
+            log.error("Project creation error: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        finally:
+            for path in upload_paths:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+
 # ── Status ──────────────────────────────────────────────────────
 
 
@@ -162,3 +215,16 @@ async def status() -> StatusResponse:
         return StatusResponse(status="ok", logged_in=logged_in, current_thread=tid)
     except Exception:
         return StatusResponse(status="ok", logged_in=False, current_thread="")
+
+
+@router.post("/control/show-login", response_model=ControlResponse)
+async def show_login() -> ControlResponse:
+    """Show the managed browser so the local user can sign in or recover."""
+    if _browser is None:
+        raise HTTPException(status_code=503, detail="Browser not initialized")
+    try:
+        logged_in = await _browser.show_login()
+        return ControlResponse(status="ok", logged_in=logged_in)
+    except Exception as exc:
+        log.error("Show-login control failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=503, detail="Managed browser is unavailable") from exc

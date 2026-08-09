@@ -46,3 +46,21 @@ class StatusResponse(BaseModel):
     status: str = "ok"
     logged_in: bool = False
     current_thread: str = ""
+
+
+class ControlResponse(BaseModel):
+    """Result of a local sidecar control action."""
+    status: str = "ok"
+    logged_in: bool = False
+
+
+class ProjectCreateRequest(BaseModel):
+    """Create a ChatGPT Web Project through the logged-in browser."""
+    name: str = Field(..., min_length=1)
+    instructions: str = ""
+    files: list[dict] = Field(default_factory=list)
+
+
+class ProjectCreateResponse(BaseModel):
+    project_ref: str
+    warnings: list[str] = Field(default_factory=list)

@@ -44,6 +44,7 @@ cookies.json
 # ── OS ──
 .DS_Store
 Thumbs.db
+._*
 
 # ── Nix ──
 result
