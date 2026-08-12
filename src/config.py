@@ -35,8 +35,17 @@ def _runtime_path(env_name: str, fallback: Path) -> Path:
 
 
 _NATIVE_SIDECAR = os.getenv("NATIVE_SIDECAR", "false").lower() == "true"
+_RCA_MODE = os.getenv("RCA_MODE", "false").lower() == "true"
 _LOCAL_APP_DATA = Path(os.getenv("LOCALAPPDATA", str(_PROJECT_ROOT)))
 _NATIVE_DATA_ROOT = _LOCAL_APP_DATA / "AppStran" / "CatGPT"
+_CORS_ENV = os.getenv("CORS_ORIGINS")
+_CORS_ORIGINS: tuple[str, ...]
+if _CORS_ENV is None:
+    _CORS_ORIGINS = () if _RCA_MODE else ("*",)
+else:
+    _CORS_ORIGINS = tuple(
+        origin.strip() for origin in _CORS_ENV.split(",") if origin.strip()
+    )
 
 
 class Config:
@@ -45,9 +54,12 @@ class Config:
     # Paths
     PROJECT_ROOT: Path = _PROJECT_ROOT
     NATIVE_SIDECAR: bool = _NATIVE_SIDECAR
+    RCA_MODE: bool = _RCA_MODE
     BROWSER_DATA_DIR: Path = _runtime_path(
         "BROWSER_DATA_DIR",
-        (_NATIVE_DATA_ROOT / "browser-profile") if _NATIVE_SIDECAR else (_PROJECT_ROOT / "browser_data"),
+        (_NATIVE_DATA_ROOT / "browser-profile")
+        if _NATIVE_SIDECAR
+        else (_PROJECT_ROOT / "browser_data"),
     )
     LOG_DIR: Path = _runtime_path(
         "LOG_DIR",
@@ -55,7 +67,9 @@ class Config:
     )
     IMAGES_DIR: Path = _runtime_path(
         "IMAGES_DIR",
-        (_NATIVE_DATA_ROOT / "downloads" / "images") if _NATIVE_SIDECAR else (_PROJECT_ROOT / "downloads/images"),
+        (_NATIVE_DATA_ROOT / "downloads" / "images")
+        if _NATIVE_SIDECAR
+        else (_PROJECT_ROOT / "downloads/images"),
     )
 
     # Browser
@@ -77,6 +91,11 @@ class Config:
     # Timeouts (ms)
     RESPONSE_TIMEOUT: int = int(os.getenv("RESPONSE_TIMEOUT", "120000"))
     SELECTOR_TIMEOUT: int = int(os.getenv("SELECTOR_TIMEOUT", "10000"))
+    COMPLETION_STABLE_SAMPLES: int = int(os.getenv("COMPLETION_STABLE_SAMPLES", "3"))
+    COMPLETION_STABLE_MS: int = int(os.getenv("COMPLETION_STABLE_MS", "3000"))
+    PROVIDER_DEADLINE_MS: int = int(os.getenv("PROVIDER_DEADLINE_MS", "180000"))
+    MAX_REQUEST_BYTES: int = 4_194_304
+    MAX_OUTPUT_BYTES: int = 8_388_608
 
     # Human simulation (ms)
     TYPING_SPEED_MIN: int = int(os.getenv("TYPING_SPEED_MIN", "50"))
@@ -88,7 +107,9 @@ class Config:
     # ChatGPT Web rate-limits bursts of sidebar/project navigation. Lane
     # pages remain concurrent for generation, but their initial UI setup is
     # deliberately staggered.
-    LANE_BOOTSTRAP_GAP_SECONDS: float = float(os.getenv("LANE_BOOTSTRAP_GAP_SECONDS", "5"))
+    LANE_BOOTSTRAP_GAP_SECONDS: float = float(
+        os.getenv("LANE_BOOTSTRAP_GAP_SECONDS", "5")
+    )
 
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "DEBUG")
@@ -98,7 +119,10 @@ class Config:
     API_HOST: str = os.getenv("API_HOST", "127.0.0.1")
     API_PORT: int = int(os.getenv("API_PORT", "8000"))
     RATE_LIMIT_SECONDS: int = int(os.getenv("RATE_LIMIT_SECONDS", "5"))
-    API_TOKEN: str = os.getenv("API_TOKEN", "")  # Bearer token for API auth (empty = no auth)
+    API_TOKEN: str = os.getenv(
+        "API_TOKEN", ""
+    )  # Bearer token for API auth (empty = no auth)
+    CORS_ORIGINS: tuple[str, ...] = _CORS_ORIGINS
     LANE_COUNT: int = max(1, min(10, int(os.getenv("CATGPT_LANE_COUNT", "2"))))
     MAX_CONCURRENCY: int = max(
         1,

@@ -9,7 +9,10 @@ previous assistant response is returned for the current request.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import re
+import time
 
 from patchright.async_api import Page
 from patchright._impl._errors import TargetClosedError
@@ -18,8 +21,14 @@ from src.selectors import Selectors
 from src.browser.human import idle_mouse_movement
 from src.log import setup_logging
 from src.config import Config
+from src.chatgpt.models import (
+    CompletionEvidence,
+    CompletionResult,
+    CompletionStatus,
+)
 
 log = setup_logging("detector")
+_monotonic = time.monotonic
 
 
 def normalize_assistant_text(text: str | None) -> str:
@@ -28,6 +37,11 @@ def normalize_assistant_text(text: str | None) -> str:
     cleaned = re.sub(r"^ChatGPT said:\s*", "", cleaned, flags=re.IGNORECASE).strip()
     cleaned = re.sub(r"^You said:\s*", "", cleaned, flags=re.IGNORECASE).strip()
     return cleaned
+
+
+def _assistant_text_sha256(text: str) -> str:
+    """Hash normalized text without retaining another content copy."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def is_incomplete_response_text(text: str | None) -> bool:
@@ -79,16 +93,13 @@ async def _dump_all_turns(page: Page) -> list[dict]:
                 const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
                 return turns.map((turn, idx) => {
                     const role = turn.getAttribute('data-turn') || 'unknown';
-                    const testid = turn.getAttribute('data-testid') || '';
-                    const turnId = turn.getAttribute('data-turn-id') || '';
-                    const text = (turn.innerText || '').trim().substring(0, 100);
+                    const textLength = (turn.innerText || '').trim().length;
                     const buttons = turn.querySelectorAll('button').length;
                     const copyBtn = Boolean(turn.querySelector(
                         'button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"], button[aria-label="Copy"]'
                     ));
                     const hasArticle = Boolean(turn.querySelector('article'));
-                    const childTags = Array.from(turn.children).map(c => c.tagName).join(',');
-                    return { idx, role, testid, turnId, text, buttons, copyBtn, hasArticle, childTags };
+                    return { idx, role, textLength, buttons, copyBtn, hasArticle };
                 });
             }
             """
@@ -259,55 +270,237 @@ async def wait_for_response_complete(
     expected_msg_count: int | None = None,
     timeout_ms: int | None = None,
     previous_turn_signature: str | None = None,
-) -> bool:
+    max_output_bytes: int | None = None,
+) -> CompletionResult:
     """
     Wait until ChatGPT finishes generating the current response.
 
-    Uses latest-turn alignment to avoid returning stale previous-turn output.
+    A result is complete only when the newest assistant turn has a final action,
+    the stop control is absent, non-transient text is stable for the configured
+    sample count and duration, and all evidence points to that same turn.
     """
     timeout = timeout_ms or Config.RESPONSE_TIMEOUT
     log.info(f"Waiting for response (timeout: {timeout}ms)...")
+    if timeout <= 0:
+        return CompletionResult(status=CompletionStatus.TIMEOUT)
 
-    pre_copy_count = await _count_copy_buttons(page)
-    log.debug(f"Copy buttons before send: {pre_copy_count}")
+    required_samples = max(3, Config.COMPLETION_STABLE_SAMPLES)
+    required_stable_ms = max(3000, Config.COMPLETION_STABLE_MS)
+    output_limit = max_output_bytes or Config.MAX_OUTPUT_BYTES
+    poll_interval = max(0.001, Config.POLL_INTERVAL_MS / 1000)
+    deadline = _monotonic() + (timeout / 1000)
 
-    if previous_turn_signature:
-        log.debug(f"Previous assistant turn signature: {previous_turn_signature}")
-        await _wait_for_new_turn_signature(page, previous_turn_signature, timeout_ms=30000)
-    elif expected_msg_count is not None:
-        log.debug(f"Waiting for assistant message #{expected_msg_count}...")
-        waited = 0
-        while waited < 30000:
-            current_count = await count_assistant_messages(page)
-            if current_count >= expected_msg_count:
-                log.debug(f"Assistant message target reached (count: {current_count})")
-                break
-            await asyncio.sleep(0.5)
-            waited += 500
+    last_text = ""
+    stable_samples = 0
+    stable_started_at: float | None = None
+    saw_stale_turn = False
+    saw_new_turn = False
+    saw_transient = False
+    selector_failures = 0
+    latest_evidence = CompletionEvidence()
 
-    log.debug("Waiting for copy button or image on latest assistant turn...")
-    completed = await _wait_for_copy_button_or_image(page, timeout, previous_turn_signature)
-    if completed == "copy":
-        log.info("Response complete — copy button appeared on latest turn")
-        return True
-    if completed == "image":
-        log.info("Response complete — generated image detected on latest turn")
-        return True
+    while _monotonic() < deadline:
+        page_error = await _check_page_error(page)
+        if page_error == "login_required":
+            return CompletionResult(
+                status=CompletionStatus.LOGIN_REQUIRED,
+                evidence=latest_evidence,
+            )
+        if page_error == "rate_limited":
+            return CompletionResult(
+                status=CompletionStatus.RATE_LIMITED,
+                evidence=latest_evidence,
+            )
+        try:
+            snapshot = await _latest_assistant_turn_snapshot(page)
+        except TargetClosedError:
+            return CompletionResult(
+                status=CompletionStatus.SELECTOR_DRIFT,
+                evidence=latest_evidence,
+            )
+        except Exception as exc:
+            selector_failures += 1
+            log.warning("Could not inspect the latest assistant turn: %s", type(exc).__name__)
+            remaining = deadline - _monotonic()
+            if remaining > 0:
+                await asyncio.sleep(min(poll_interval, remaining))
+            continue
 
-    log.info("Copy/image completion not detected, trying stop-button strategy...")
+        signature = snapshot.get("signature")
+        signature = signature if isinstance(signature, str) and signature else None
+        is_new_turn = signature is not None and (
+            previous_turn_signature is None or signature != previous_turn_signature
+        )
+        if not is_new_turn:
+            saw_stale_turn = saw_stale_turn or (
+                signature is not None and signature == previous_turn_signature
+            )
+            remaining = deadline - _monotonic()
+            if remaining > 0:
+                await asyncio.sleep(min(poll_interval, remaining))
+            continue
+
+        saw_new_turn = True
+        text = normalize_assistant_text(
+            snapshot.get("text") if isinstance(snapshot.get("text"), str) else ""
+        )
+        transient = is_incomplete_response_text(text)
+        saw_transient = saw_transient or transient
+        final_action_present = bool(
+            snapshot.get("hasCopyButton") or snapshot.get("hasImage")
+        )
+        stop_visible = await _is_stop_button_visible(page)
+
+        if len(text.encode("utf-8")) > output_limit:
+            return CompletionResult(
+                status=CompletionStatus.OUTPUT_TOO_LARGE,
+                evidence=CompletionEvidence(
+                    turn_signature=signature,
+                    output_chars=len(text),
+                    final_action_present=final_action_present,
+                    stop_button_visible=stop_visible,
+                ),
+            )
+
+        now = _monotonic()
+        if stop_visible:
+            # Streaming text is not final evidence. Start a fresh stability
+            # window only after ChatGPT's stop control has disappeared.
+            last_text = ""
+            stable_samples = 0
+            stable_started_at = None
+        elif text and not transient:
+            if text == last_text:
+                stable_samples += 1
+            else:
+                last_text = text
+                stable_samples = 1
+                stable_started_at = now
+        else:
+            last_text = ""
+            stable_samples = 0
+            stable_started_at = None
+
+        stable_for_ms = (
+            int((now - stable_started_at) * 1000)
+            if stable_started_at is not None
+            else 0
+        )
+        latest_evidence = CompletionEvidence(
+            turn_signature=signature,
+            stable_samples=stable_samples,
+            stable_for_ms=stable_for_ms,
+            output_chars=len(text),
+            output_sha256=_assistant_text_sha256(text) if text else None,
+            final_action_present=final_action_present,
+            stop_button_visible=stop_visible,
+        )
+
+        if (
+            final_action_present
+            and not stop_visible
+            and text
+            and not transient
+            and stable_samples >= required_samples
+            and stable_for_ms >= required_stable_ms
+        ):
+            latest_evidence.evidence = (
+                "new_turn_final_action_stop_absent_text_stable"
+            )
+            log.info(
+                "Verified completion for turn %s (%s stable samples)",
+                signature,
+                stable_samples,
+            )
+            return CompletionResult(
+                status=CompletionStatus.COMPLETE,
+                evidence=latest_evidence,
+            )
+
+        remaining = deadline - _monotonic()
+        if remaining > 0:
+            await asyncio.sleep(min(poll_interval, remaining))
+
+    if selector_failures and not saw_new_turn:
+        status = CompletionStatus.SELECTOR_DRIFT
+    elif saw_stale_turn and not saw_new_turn:
+        status = CompletionStatus.STALE
+    elif saw_new_turn and (
+        saw_transient
+        or not latest_evidence.final_action_present
+        or latest_evidence.output_chars == 0
+    ):
+        status = CompletionStatus.INCOMPLETE
+    else:
+        status = CompletionStatus.TIMEOUT
+
+    log.warning("Response completion was not verified (status=%s)", status.value)
+    return CompletionResult(status=status, evidence=latest_evidence)
+
+
+async def revalidate_completion_evidence(
+    page: Page,
+    completion: CompletionResult,
+    extracted_text: str,
+) -> CompletionResult:
+    """Re-check the exact final turn immediately before returning content."""
+    if not completion.verified:
+        if completion.status is CompletionStatus.COMPLETE:
+            return CompletionResult(
+                status=CompletionStatus.INCOMPLETE,
+                evidence=completion.evidence,
+            )
+        return completion
+
     try:
-        result = await _wait_via_stop_button(page, timeout)
-        if result:
-            return True
-    except Exception as e:
-        log.debug(f"Stop button strategy failed: {e}")
+        snapshot = await _latest_assistant_turn_snapshot(page)
+        stop_visible = await _is_stop_button_visible(page)
+    except Exception as exc:
+        log.warning("Could not revalidate completion evidence: %s", type(exc).__name__)
+        return CompletionResult(
+            status=CompletionStatus.SELECTOR_DRIFT,
+            evidence=completion.evidence,
+        )
 
-    log.info("Falling back to text-stability detection...")
-    try:
-        return await _wait_via_text_stability(page, timeout, previous_turn_signature)
-    except Exception as e:
-        log.error(f"All strategies failed: {e}")
-        return False
+    signature = snapshot.get("signature")
+    if signature != completion.evidence.turn_signature:
+        return CompletionResult(
+            status=CompletionStatus.STALE,
+            evidence=completion.evidence,
+        )
+
+    dom_text = normalize_assistant_text(
+        snapshot.get("text") if isinstance(snapshot.get("text"), str) else ""
+    )
+    extracted = normalize_assistant_text(extracted_text)
+    extracted_hash = _assistant_text_sha256(extracted) if extracted else None
+    final_action_present = bool(
+        snapshot.get("hasCopyButton") or snapshot.get("hasImage")
+    )
+    evidence = completion.evidence.model_copy(
+        update={
+            "final_action_present": final_action_present,
+            "stop_button_visible": stop_visible,
+        }
+    )
+
+    if stop_visible:
+        return CompletionResult(status=CompletionStatus.TIMEOUT, evidence=evidence)
+    if (
+        not final_action_present
+        or not extracted
+        or is_incomplete_response_text(extracted)
+        or dom_text != extracted
+        or extracted_hash != completion.evidence.output_sha256
+        or len(extracted) != completion.evidence.output_chars
+        or completion.evidence.stable_samples < 3
+        or completion.evidence.stable_for_ms < Config.COMPLETION_STABLE_MS
+    ):
+        return CompletionResult(
+            status=CompletionStatus.INCOMPLETE,
+            evidence=evidence,
+        )
+    return CompletionResult(status=CompletionStatus.COMPLETE, evidence=evidence)
 
 
 async def _check_page_error(page: Page) -> str | None:
@@ -328,7 +521,15 @@ async def _check_page_error(page: Page) -> str | None:
                 if (body.includes('ERR_CONNECTION_TIMED_OUT')) return 'ERR_CONNECTION_TIMED_OUT';
                 // ChatGPT error states
                 if (body.includes('Something went wrong')) return 'ChatGPT_something_went_wrong';
-                if (body.includes("We're experiencing high demand")) return 'ChatGPT_high_demand';
+                if (
+                    body.includes("We're experiencing high demand") ||
+                    body.includes('You have reached the current usage cap') ||
+                    body.includes('rate limit')
+                ) return 'rate_limited';
+                const loginLink = document.querySelector(
+                    'a[href*="/auth/login"], button[data-testid="login-button"]'
+                );
+                if (loginLink || body.includes('Log in to continue')) return 'login_required';
                 if (document.title && document.title.includes('is not available')) return 'page_not_available';
                 return null;
             }
@@ -337,6 +538,44 @@ async def _check_page_error(page: Page) -> str | None:
         return error
     except Exception:
         return None
+
+
+async def _is_stop_button_visible(page: Page) -> bool:
+    """Return whether ChatGPT is still streaming the current response."""
+    selectors = json.dumps(Selectors.STOP_BUTTON)
+    try:
+        return bool(
+            await page.evaluate(
+                f"""
+                () => {{
+                    const selectors = {selectors};
+                    for (const selector of selectors) {{
+                        let button = null;
+                        try {{
+                            button = document.querySelector(selector);
+                        }} catch (_error) {{
+                            continue;
+                        }}
+                        if (!button) continue;
+                        const style = window.getComputedStyle(button);
+                        const rect = button.getBoundingClientRect();
+                        if (
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden' &&
+                            rect.width > 0 &&
+                            rect.height > 0
+                        ) {{
+                            return true;
+                        }}
+                    }}
+                    return false;
+                }}
+                """
+            )
+        )
+    except Exception as exc:
+        log.warning(f"Could not verify stop-button state: {exc}")
+        return True
 
 
 async def _wait_for_copy_button_or_image(
@@ -375,37 +614,39 @@ async def _wait_for_copy_button_or_image(
         # Log the first snapshot for diagnostics
         if not first_snapshot_logged and elapsed >= 2:
             first_snapshot_logged = True
-            turn_text = (snapshot.get("text") or "")[:200]
+            turn_length = len(snapshot.get("text") or "")
             all_turns = await _dump_all_turns(page)
             log.debug(
                 f"First snapshot at {int(elapsed)}s | "
                 f"prev_sig={previous_turn_signature} cur_sig={signature} "
                 f"is_new={is_new_turn} copy={snapshot.get('hasCopyButton')} "
-                f"text[:{len(turn_text)}]={turn_text!r}"
+                f"text_length={turn_length}"
             )
             log.debug(f"All turns ({len(all_turns)}): {all_turns}")
 
-        if is_new_turn and snapshot.get("hasCopyButton"):
-            log.info(
-                f"Copy button detected on latest turn {signature}"
-            )
-            return "copy"
-
-        # Use snapshot data directly instead of a separate evaluate call
-        if is_new_turn and snapshot.get("hasImage"):
-            await asyncio.sleep(0.5)
-            log.info(f"Generated image detected on latest turn {signature}")
-            return "image"
+        has_copy_button = bool(snapshot.get("hasCopyButton"))
+        has_image = bool(snapshot.get("hasImage"))
+        if is_new_turn and (has_copy_button or has_image):
+            if await _is_stop_button_visible(page):
+                log.debug(f"Latest turn {signature} still streaming; completion is blocked")
+            elif has_copy_button:
+                log.info(f"Copy button detected on completed latest turn {signature}")
+                return "copy"
+            else:
+                await asyncio.sleep(0.5)
+                if not await _is_stop_button_visible(page):
+                    log.info(f"Generated image detected on completed latest turn {signature}")
+                    return "image"
 
         if elapsed >= next_heartbeat:
             next_heartbeat = elapsed + heartbeat
             # Diagnostic: log what we see on the latest assistant turn
-            turn_text = (snapshot.get("text") or "")[:200]
+            turn_length = len(snapshot.get("text") or "")
             log.debug(
                 f"Still waiting for copy/image... ({int(elapsed)}s) | "
                 f"sig={signature} is_new={is_new_turn} "
                 f"copy={snapshot.get('hasCopyButton')} "
-                f"text[:{len(turn_text)}]={turn_text!r}"
+                f"text_length={turn_length}"
             )
 
             # Dump all turn info for debugging
@@ -496,6 +737,13 @@ async def _wait_via_text_stability(
             stable_count += 1
             log.debug(f"Text stable ({stable_count}/{required_stable})")
             if stable_count >= required_stable:
+                if await _is_stop_button_visible(page):
+                    log.debug("Text is stable but response is still streaming; continuing wait")
+                    stable_count = 0
+                    last_text = text
+                    await asyncio.sleep(poll_interval)
+                    elapsed += poll_interval
+                    continue
                 if is_incomplete_response_text(text) and not bool(snapshot.get("hasCopyButton")):
                     log.debug("Stable text looks like transient thinking status; continuing wait")
                     stable_count = 0

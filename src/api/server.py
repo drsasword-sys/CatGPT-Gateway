@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,11 +38,61 @@ _client: ChatGPTClient | ClaudeClient | None = None
 _lane_pool: ChatGPTLanePool | None = None
 
 
+def validate_rca_runtime_security() -> None:
+    """Fail startup when effective RCA-mode settings are unsafe."""
+    if not Config.RCA_MODE:
+        return
+    if Config.PROVIDER != "chatgpt":
+        raise RuntimeError("RCA mode requires the ChatGPT provider")
+    provider_url = urlparse(Config.CHATGPT_URL)
+    try:
+        safe_provider_url = (
+            provider_url.scheme == "https"
+            and provider_url.hostname == "chatgpt.com"
+            and provider_url.username is None
+            and provider_url.password is None
+            and provider_url.port is None
+            and provider_url.path in {"", "/"}
+            and not provider_url.params
+            and not provider_url.query
+            and not provider_url.fragment
+        )
+    except ValueError:
+        safe_provider_url = False
+    if not safe_provider_url:
+        raise RuntimeError("RCA mode requires the canonical ChatGPT URL")
+    if Config.API_HOST != "127.0.0.1":
+        raise RuntimeError("RCA mode API host must be exactly 127.0.0.1")
+    if not Config.API_TOKEN.strip():
+        raise RuntimeError("RCA mode requires a non-empty API token")
+    if Config.LANE_COUNT != 1:
+        raise RuntimeError("RCA mode requires lane count 1")
+    if Config.MAX_CONCURRENCY != 1:
+        raise RuntimeError("RCA mode requires max concurrency 1")
+    if "*" in Config.CORS_ORIGINS:
+        raise RuntimeError("RCA mode forbids wildcard CORS")
+    for origin in Config.CORS_ORIGINS:
+        parsed = urlparse(origin)
+        if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
+            "127.0.0.1",
+            "localhost",
+            "::1",
+        }:
+            raise RuntimeError("RCA mode CORS origins must be pinned to loopback")
+    if Config.PROVIDER_DEADLINE_MS <= 0:
+        raise RuntimeError("RCA mode requires a finite provider deadline")
+    if Config.COMPLETION_STABLE_SAMPLES < 3:
+        raise RuntimeError("RCA mode requires at least 3 stable samples")
+    if Config.COMPLETION_STABLE_MS < 3000:
+        raise RuntimeError("RCA mode requires at least 3000ms text stability")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: launch browser. Shutdown: close it."""
     global _browser, _client, _lane_pool
 
+    validate_rca_runtime_security()
     log.info("Starting browser for API server...")
     _browser = BrowserManager()
     page = await _browser.start()
@@ -124,6 +175,115 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+class RcaRouteGuardMiddleware:
+    """Expose only the approved RCA surface when dedicated mode is enabled."""
+
+    ALLOWED_PATHS = {
+        "/docs",
+        "/redoc",
+        "/openapi.json",
+        "/healthz",
+        "/status",
+        "/control/show-login",
+        "/v1/models",
+        "/v1/chat/completions",
+    }
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            Config.RCA_MODE
+            and scope["type"] == "http"
+            and scope.get("method") != "OPTIONS"
+            and scope.get("path") not in self.ALLOWED_PATHS
+        ):
+            response = JSONResponse(
+                status_code=404,
+                content={
+                    "error": {
+                        "code": "RCA_ROUTE_DISABLED",
+                        "message": "This route is disabled in RCA mode.",
+                    }
+                },
+            )
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+class RequestBodyLimitMiddleware:
+    """Enforce the raw request-body cap before JSON parsing or dispatch."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("method") not in {
+            "POST",
+            "PUT",
+            "PATCH",
+        }:
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        content_length = headers.get(b"content-length", b"")
+        try:
+            declared_size = int(content_length) if content_length else None
+        except ValueError:
+            declared_size = None
+        if declared_size is not None and declared_size > Config.MAX_REQUEST_BYTES:
+            await self._reject(scope, receive, send)
+            return
+
+        messages: list[dict] = []
+        total = 0
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message.get("type") == "http.request":
+                total += len(message.get("body", b""))
+                if total > Config.MAX_REQUEST_BYTES:
+                    await self._reject(scope, receive, send)
+                    return
+                if not message.get("more_body", False):
+                    break
+            elif message.get("type") == "http.disconnect":
+                break
+
+        index = 0
+
+        async def replay_receive():
+            nonlocal index
+            if index < len(messages):
+                message = messages[index]
+                index += 1
+                return message
+            return {"type": "http.disconnect"}
+
+        await self.app(scope, replay_receive, send)
+
+    @staticmethod
+    async def _reject(scope: Scope, receive: Receive, send: Send) -> None:
+        response = JSONResponse(
+            status_code=413,
+            content={
+                "error": {
+                    "code": "REQUEST_TOO_LARGE",
+                    "message": "Request body exceeded the hard input budget.",
+                    "request_id": "",
+                    "completion_status": "not_dispatched",
+                    "provider_outcome": "not_dispatched",
+                    "manual_action_required": False,
+                }
+            },
+        )
+        await response(scope, receive, send)
+
+
 # ── Bearer Token Auth Middleware ────────────────────────────────
 class BearerTokenMiddleware:
     """
@@ -151,7 +311,11 @@ class BearerTokenMiddleware:
             await self.app(scope, receive, send)
             return
 
-        path = scope.get("path", "").encode() if isinstance(scope.get("path"), str) else scope.get("raw_path", b"")
+        path = (
+            scope.get("path", "").encode()
+            if isinstance(scope.get("path"), str)
+            else scope.get("raw_path", b"")
+        )
         # Also check the string path for comparison
         path_str = scope.get("path", "")
         if path_str in {"/docs", "/redoc", "/openapi.json", "/healthz"}:
@@ -183,13 +347,15 @@ class BearerTokenMiddleware:
 
 
 app.add_middleware(BearerTokenMiddleware)
+app.add_middleware(RequestBodyLimitMiddleware)
+app.add_middleware(RcaRouteGuardMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=list(Config.CORS_ORIGINS),
+    allow_credentials="*" not in Config.CORS_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 app.include_router(router)
@@ -199,7 +365,18 @@ app.include_router(openai_router)
 @app.get("/healthz", include_in_schema=False)
 async def healthz():
     """Unauthenticated health-check for Docker / load-balancers."""
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "rca_mode": Config.RCA_MODE,
+        "api_host": Config.API_HOST,
+        "auth_required": bool(Config.API_TOKEN),
+        "lane_count": Config.LANE_COUNT,
+        "max_concurrency": Config.MAX_CONCURRENCY,
+        "cors_origins": list(Config.CORS_ORIGINS),
+        "provider_deadline_ms": Config.PROVIDER_DEADLINE_MS,
+        "max_request_bytes": Config.MAX_REQUEST_BYTES,
+        "max_output_bytes": Config.MAX_OUTPUT_BYTES,
+    }
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+import uuid
 from urllib.parse import urlparse
 
 from patchright.async_api import Page
@@ -23,12 +24,44 @@ from src.chatgpt.detector import (
     count_assistant_messages,
     get_latest_assistant_turn_signature,
     is_incomplete_response_text,
+    revalidate_completion_evidence,
 )
 from src.chatgpt.image_handler import extract_images_from_response
-from src.chatgpt.models import ChatResponse
+from src.chatgpt.models import (
+    ChatResponse,
+    CompletionResult,
+    CompletionStatus,
+    NetworkStreamStatus,
+)
 from src.log import setup_logging
+from src.network_recorder import NetworkRecorder
 
 log = setup_logging("chatgpt_client")
+
+
+class ChatGPTCompletionError(RuntimeError):
+    """Typed, content-free error for an unverified browser response."""
+
+    def __init__(self, result: CompletionResult) -> None:
+        self.result = result
+        super().__init__("ChatGPT response completion was not verified")
+
+
+class ChatGPTProviderStateError(RuntimeError):
+    """Typed provider UI state that is safe to map to an API error."""
+
+    def __init__(self, state: str, provider_outcome: str | None = None) -> None:
+        if state not in {"login_required", "rate_limited"}:
+            raise ValueError("Unsupported ChatGPT provider state")
+        default_outcome = (
+            "not_dispatched" if state == "login_required" else "rejected"
+        )
+        outcome = provider_outcome or default_outcome
+        if outcome not in {"not_dispatched", "rejected", "unknown"}:
+            raise ValueError("Unsupported provider outcome")
+        self.state = state
+        self.provider_outcome = outcome
+        super().__init__("ChatGPT provider is not ready")
 
 
 class ChatGPTClient:
@@ -40,53 +73,39 @@ class ChatGPTClient:
 
     def __init__(self, page: Page) -> None:
         self._page = page
+        self._network_recorder = NetworkRecorder(page)
+        self._network_recorder.start()
         self._setup_network_logging()
 
     def _setup_network_logging(self) -> None:
-        """Monitor network requests, WebSockets, and JS errors for debugging."""
-        # Only log important API calls at INFO; sentinel/ping/heartbeat at DEBUG
-        _important_paths = ("/f/conversation", "/conversations?", "/stream_status")
+        """Log event classes without URL/query/header/body or frame payloads."""
 
         def on_request(request):
-            url = request.url
-            if "backend-api" in url:
-                if any(p in url for p in _important_paths):
-                    log.info(f"NET REQ: {request.method} {url[:200]}")
-                else:
-                    log.debug(f"NET REQ: {request.method} {url[:200]}")
+            if "backend-api" in request.url:
+                log.debug("NET REQ: %s backend-api", request.method)
 
         async def on_response(response):
-            url = response.url
-            if "backend-api" in url:
-                if any(p in url for p in _important_paths):
-                    log.info(f"NET RESP: {response.status} {url[:200]}")
-                else:
-                    log.debug(f"NET RESP: {response.status} {url[:200]}")
+            if "backend-api" in response.url:
+                log.debug("NET RESP: %s backend-api", response.status)
 
         def on_request_failed(request):
-            url = request.url
-            failure = request.failure or "unknown"
-            if "chrome-extension" not in url and "favicon" not in url:
-                # Patchright internal injection is expected to fail
-                if "patchright" in url:
-                    log.debug(f"NET FAIL: {url[:150]} — {failure}")
-                else:
-                    log.warning(f"NET FAIL: {url[:150]} — {failure}")
+            if "chrome-extension" not in request.url and "favicon" not in request.url:
+                log.warning("NET FAIL: resource_type=%s", request.resource_type)
 
         def on_console(msg):
             if msg.type == "error":
-                log.info(f"JS ERROR: {msg.text[:300]}")
+                log.info("JS ERROR reported")
             elif msg.type == "warning":
-                log.debug(f"JS WARNING: {msg.text[:300]}")
+                log.debug("JS WARNING reported")
 
         def on_page_error(error):
-            log.error(f"JS PAGE ERROR: {error}")
+            log.error("JS PAGE ERROR: %s", type(error).__name__)
 
         def on_websocket(ws):
-            log.debug(f"WS OPEN: {ws.url[:200]}")
-            ws.on("framereceived", lambda payload: log.debug(f"WS RECV: {str(payload)[:200]}"))
-            ws.on("framesent", lambda payload: log.debug(f"WS SEND: {str(payload)[:200]}"))
-            ws.on("close", lambda _: log.debug(f"WS CLOSE: {ws.url[:200]}"))
+            log.debug("WS OPEN")
+            ws.on("framereceived", lambda _payload: log.debug("WS RECV"))
+            ws.on("framesent", lambda _payload: log.debug("WS SEND"))
+            ws.on("close", lambda _: log.debug("WS CLOSE"))
 
         self._page.on("request", on_request)
         self._page.on("response", on_response)
@@ -101,7 +120,14 @@ class ChatGPTClient:
 
     # ── Core: Send & Receive ────────────────────────────────────
 
-    async def send_message(self, text: str, image_paths: list[str] | None = None, file_paths: list[str] | None = None) -> ChatResponse:
+    async def send_message(
+        self,
+        text: str,
+        image_paths: list[str] | None = None,
+        file_paths: list[str] | None = None,
+        request_id: str | None = None,
+        deadline_ms: int | None = None,
+    ) -> ChatResponse:
         """
         Send a message to ChatGPT and wait for the complete response.
 
@@ -122,13 +148,19 @@ class ChatGPTClient:
         Returns ChatResponse with the assistant's reply and metadata.
         """
         all_attachments = (image_paths or []) + (file_paths or [])
-        log.info(f"Sending message ({len(text)} chars, {len(all_attachments)} attachments): {text[:80]}...")
+        log.info(
+            "Sending message (%s chars, %s attachments)",
+            len(text),
+            len(all_attachments),
+        )
         start_time = time.time()
 
         # 0. Check page health — recover from DNS errors before trying to send
         page_error = await self._detect_page_error()
         if page_error:
             log.warning(f"Page error detected before send: {page_error}")
+            if page_error in {"login_required", "rate_limited"}:
+                raise ChatGPTProviderStateError(page_error)
             raise RuntimeError(f"Page is in error state: {page_error}")
 
         # 0.5 Count existing assistant messages so we know when a new one appears
@@ -158,7 +190,10 @@ class ChatGPTClient:
         if not input_selector:
             raise RuntimeError("Could not find chat input element")
 
-        # 3. Paste the message (all at once)
+        # 3. Arm exact-request network correlation, then paste the message.
+        logical_request_id = request_id or f"browser-{uuid.uuid4()}"
+        if self._network_recorder is not None:
+            self._network_recorder.arm(logical_request_id)
         await human_type(self._page, input_selector, text)
 
         # 4. Poll briefly for auto-submit (execCommand can trigger
@@ -185,14 +220,33 @@ class ChatGPTClient:
         # 5. Wait for response with message count awareness
         log.info("Waiting for ChatGPT response...")
         expected_count = pre_count + 1
-        completed = await wait_for_response_complete(
+        completion = await wait_for_response_complete(
             self._page,
             expected_msg_count=expected_count,
+            timeout_ms=min(
+                Config.RESPONSE_TIMEOUT,
+                deadline_ms or Config.RESPONSE_TIMEOUT,
+            ),
             previous_turn_signature=pre_turn_signature,
+            max_output_bytes=Config.MAX_OUTPUT_BYTES,
         )
 
-        if not completed:
-            log.warning("Response may not be complete (timeout)")
+        if completion.status is CompletionStatus.LOGIN_REQUIRED:
+            raise ChatGPTProviderStateError(
+                "login_required",
+                provider_outcome="unknown",
+            )
+        if completion.status is CompletionStatus.RATE_LIMITED:
+            raise ChatGPTProviderStateError("rate_limited")
+        if completion.status is CompletionStatus.COMPLETE and not completion.verified:
+            completion = CompletionResult(
+                status=CompletionStatus.INCOMPLETE,
+                evidence=completion.evidence,
+            )
+        if completion.status is CompletionStatus.OUTPUT_TOO_LARGE:
+            await self._stop_generation()
+        if not completion.verified:
+            raise ChatGPTCompletionError(completion)
 
         # Small buffer after completion to let DOM settle
         await asyncio.sleep(0.2)
@@ -209,8 +263,6 @@ class ChatGPTClient:
             # from the turn's DOM instead (will get the image title/desc)
             response_text = await self._extract_image_turn_text(pre_turn_signature)
             log.info(f"Response contains {len(images)} generated image(s)")
-            for img in images:
-                log.info(f"  Image: {img.alt or img.prompt_title} → {img.local_path}")
         else:
             # Standard text response — use copy button (most reliable)
             response_text = await extract_last_response_via_copy(
@@ -256,13 +308,55 @@ class ChatGPTClient:
                         response_text = retry_text
                     log.warning(f"Retry {attempt} still incomplete/transient")
 
+        if not response_text.strip() or is_incomplete_response_text(response_text):
+            raise ChatGPTCompletionError(
+                CompletionResult(
+                    status=CompletionStatus.INCOMPLETE,
+                    evidence=completion.evidence,
+                )
+            )
+
+        if len(response_text.encode("utf-8")) > Config.MAX_OUTPUT_BYTES:
+            await self._stop_generation()
+            raise ChatGPTCompletionError(
+                CompletionResult(
+                    status=CompletionStatus.OUTPUT_TOO_LARGE,
+                    evidence=completion.evidence,
+                )
+            )
+
+        completion = await revalidate_completion_evidence(
+            self._page,
+            completion,
+            response_text,
+        )
+        if not completion.verified:
+            raise ChatGPTCompletionError(completion)
+
+        network_status = (
+            self._network_recorder.stream_status
+            if self._network_recorder is not None
+            else NetworkStreamStatus.UNAVAILABLE
+        )
+        completion.evidence.network_stream = network_status
+        if network_status in {
+            NetworkStreamStatus.OPEN,
+            NetworkStreamStatus.FAILED,
+            NetworkStreamStatus.CONFLICT,
+        }:
+            raise ChatGPTCompletionError(
+                CompletionResult(
+                    status=CompletionStatus.TIMEOUT,
+                    evidence=completion.evidence,
+                )
+            )
+
         elapsed_ms = int((time.time() - start_time) * 1000)
         thread_id = self._extract_thread_id()
 
         log.info(
             f"Response received ({elapsed_ms}ms, {len(response_text)} chars"
-            f"{f', {len(images)} images' if has_images else ''}): "
-            f"{response_text[:80]}..."
+            f"{f', {len(images)} images' if has_images else ''})"
         )
 
         return ChatResponse(
@@ -271,7 +365,21 @@ class ChatGPTClient:
             response_time_ms=elapsed_ms,
             images=images,
             has_images=has_images,
+            completion=completion,
         )
+
+    async def _stop_generation(self) -> None:
+        """Best-effort stop after a hard output-budget breach."""
+        for selector in Selectors.STOP_BUTTON:
+            try:
+                button = await self._page.query_selector(selector)
+                if button and await button.is_visible():
+                    await button.click()
+                    log.warning("Stopped generation after output budget breach")
+                    return
+            except Exception:
+                continue
+        log.warning("Output budget breached; no visible stop control was available")
 
     # ── Navigation ──────────────────────────────────────────────
 
@@ -291,6 +399,7 @@ class ChatGPTClient:
                 )
                 if turn_count == 0:
                     log.info("Already on a fresh chat — skipping navigation")
+                    await self._verify_fresh_chat()
                     return
             except Exception:
                 pass
@@ -301,7 +410,7 @@ class ChatGPTClient:
                 btn = await self._page.query_selector(selector)
                 if btn and await btn.is_visible():
                     await btn.click()
-                    log.info(f"New chat via SPA button: {selector}")
+                    log.info("New chat via SPA button")
                     await asyncio.sleep(1)
                     # Verify we're on a fresh chat
                     try:
@@ -309,7 +418,7 @@ class ChatGPTClient:
                             "document.querySelectorAll('[data-testid^=\"conversation-turn-\"]').length"
                         )
                         if turn_count == 0:
-                            await self._wait_for_chat_input()
+                            await self._verify_fresh_chat()
                             return
                     except Exception:
                         pass
@@ -324,7 +433,7 @@ class ChatGPTClient:
             page_error = await self._detect_page_error()
             if not page_error:
                 log.info("New chat started (JS navigation)")
-                await self._wait_for_chat_input()
+                await self._verify_fresh_chat()
                 return
         except Exception as e:
             log.warning(f"JS navigation failed: {e}")
@@ -355,21 +464,33 @@ class ChatGPTClient:
                 raise RuntimeError(f"Page error persists after {max_attempts} attempts: {page_error}")
 
             log.info("New chat started (page.goto)")
-            await self._wait_for_chat_input()
+            await self._verify_fresh_chat()
             return
+
+    async def _verify_fresh_chat(self) -> None:
+        """Require zero conversation turns and a ready composer."""
+        try:
+            turn_count = await self._page.evaluate(
+                "document.querySelectorAll('[data-testid^=\"conversation-turn-\"]').length"
+            )
+        except Exception as exc:
+            raise RuntimeError("Fresh chat state could not be inspected") from exc
+        if turn_count != 0:
+            raise RuntimeError("ChatGPT conversation is not fresh")
+        await self._wait_for_chat_input()
 
     async def _wait_for_chat_input(self) -> None:
         """Wait for the chat input to become visible and interactive."""
         for selector in Selectors.CHAT_INPUT:
             try:
                 await self._page.wait_for_selector(selector, timeout=10000, state="visible")
-                log.debug(f"Chat input ready: {selector}")
+                log.debug("Chat input ready")
                 # Brief settle for React handlers to attach
                 await asyncio.sleep(0.5)
                 return
             except Exception:
                 continue
-        log.warning("Chat input not found — page may not be fully ready")
+        raise RuntimeError("Fresh chat input was not ready")
 
     async def _detect_page_error(self) -> str | None:
         """Check if the current page shows a browser or ChatGPT error."""
@@ -386,7 +507,11 @@ class ChatGPTClient:
                     if (body.includes('ERR_CONNECTION_TIMED_OUT')) return 'ERR_CONNECTION_TIMED_OUT';
                     if (body.includes('Too many requests') ||
                         body.includes('temporarily limited access to your conversations'))
-                        return 'conversation_history_rate_limit';
+                        return 'rate_limited';
+                    const loginLink = document.querySelector(
+                        'a[href*="/auth/login"], button[data-testid="login-button"]'
+                    );
+                    if (loginLink) return 'login_required';
                     if (title.includes("can't be reached") || title.includes("is not available"))
                         return 'page_unreachable';
                     if (body.includes('Something went wrong')) return 'ChatGPT_error';
@@ -539,10 +664,10 @@ class ChatGPTClient:
                     state="visible",
                 )
                 if el:
-                    log.debug(f"Found {name} via: {selector}")
+                    log.debug("Found %s", name)
                     return selector
             except Exception:
-                log.debug(f"Selector miss for {name}: {selector}")
+                log.debug("Selector candidate missed for %s", name)
                 continue
 
         log.warning(f"No working selector found for: {name}")
@@ -559,8 +684,7 @@ class ChatGPTClient:
                     // Check for role="dialog" overlays
                     const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog[open]');
                     for (const d of dialogs) {
-                        const text = (d.innerText || '').trim().substring(0, 200);
-                        info.found.push('dialog: ' + text);
+                        info.found.push('dialog');
 
                         // Try to find and click dismiss/close buttons
                         const closeBtn = d.querySelector(
@@ -586,8 +710,7 @@ class ChatGPTClient:
                     // Check for rate limit or error banners
                     const banners = document.querySelectorAll('[class*="banner"], [class*="toast"], [class*="alert"]');
                     for (const b of banners) {
-                        const text = (b.innerText || '').trim().substring(0, 200);
-                        if (text) info.found.push('banner: ' + text);
+                        if ((b.innerText || '').trim()) info.found.push('banner');
                     }
 
                     return info;
@@ -598,7 +721,7 @@ class ChatGPTClient:
                 if result.get("dismissed"):
                     log.info(f"Dismissed overlays: {result['dismissed']}")
                 if result.get("found"):
-                    log.debug(f"Page overlays found: {result['found']}")
+                    log.debug("Page overlays found: %s", len(result["found"]))
         except Exception as e:
             log.debug(f"Overlay check failed: {e}")
 
@@ -620,7 +743,10 @@ class ChatGPTClient:
                             selector: sel,
                             disabled: btn.disabled,
                             ariaDisabled: btn.getAttribute('aria-disabled'),
-                            visible: btn.offsetParent !== null,
+                            visible: btn.getClientRects().length > 0,
+                            dataTestId: btn.getAttribute('data-testid'),
+                            ariaLabel: btn.getAttribute('aria-label'),
+                            text: (btn.innerText || '').trim().substring(0, 40),
                             classes: btn.className.substring(0, 100),
                         };
                     }
@@ -629,17 +755,32 @@ class ChatGPTClient:
             }
             """
         )
-        log.debug(f"Send button state: {btn_state}")
+        log.debug("Send button state inspected")
+
+        if isinstance(btn_state, dict) and btn_state.get("visible"):
+            stop_markers = (
+                str(btn_state.get("dataTestId") or ""),
+                str(btn_state.get("ariaLabel") or ""),
+                str(btn_state.get("text") or ""),
+            )
+            if btn_state.get("dataTestId") == "stop-button" or any(
+                "stop" in marker.casefold() for marker in stop_markers
+            ):
+                raise RuntimeError("ChatGPT is still generating a response")
 
         # Don't click a disabled send button — the input wasn't recognized
-        if isinstance(btn_state, dict) and btn_state.get("disabled"):
-            log.warning("Send button is disabled — text may not have been inserted properly")
-            return False
+        if isinstance(btn_state, dict):
+            if not btn_state.get("visible"):
+                log.warning("Send button is not visible")
+                return False
+            if btn_state.get("disabled") or btn_state.get("ariaDisabled") == "true":
+                log.warning("Send button is disabled — text may not have been inserted properly")
+                return False
 
         selector = await self._find_selector(Selectors.SEND_BUTTON, "send button")
         if selector:
             await human_click(self._page, selector)
-            log.info(f"Send button clicked via: {selector}")
+            log.info("Send button clicked")
             return True
         return False
 

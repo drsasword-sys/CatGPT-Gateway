@@ -2,6 +2,7 @@
 browser_data/
 browser_data_claude/
 chrome-profile/
+AppStran/
 
 # ── Logs ──
 logs/

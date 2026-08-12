@@ -19,7 +19,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from src.api.openai_schemas import (
     ChatCompletionRequest,
@@ -44,8 +44,13 @@ from src.api.openai_schemas import (
     ToolDefinition,
     UsageInfo,
 )
-from src.chatgpt.client import ChatGPTClient
+from src.chatgpt.client import (
+    ChatGPTClient,
+    ChatGPTCompletionError,
+    ChatGPTProviderStateError,
+)
 from src.chatgpt.lane_pool import ChatGPTLanePool
+from src.chatgpt.models import CompletionStatus
 from src.claude.client import ClaudeClient
 from src.config import Config
 from src.log import setup_logging
@@ -76,9 +81,18 @@ _thread_message_count = 0
 _MAX_THREAD_MESSAGES = 8  # Start a new chat after this many requests
 _last_response_time: float = 0.0
 _MIN_MESSAGE_GAP = 3.0  # Minimum seconds between messages (ChatGPT needs cooldown)
+_RCA_CONSUMER = "rca-engine-local-v1"
 
 
-async def _ensure_fresh_chat() -> None:
+class FreshChatError(RuntimeError):
+    """Fresh-chat navigation could not be verified before dispatch."""
+
+
+async def _ensure_fresh_chat(
+    *,
+    force: bool = False,
+    fail_closed: bool = False,
+) -> None:
     """Enforce cooldown between messages and start new chat if thread is full.
 
     ChatGPT's web UI degrades after ~6-8 messages in a thread (stops
@@ -98,7 +112,7 @@ async def _ensure_fresh_chat() -> None:
             log.debug(f"Cooldown: waiting {wait:.1f}s before next message")
             await asyncio.sleep(wait)
 
-    if _thread_message_count < _MAX_THREAD_MESSAGES:
+    if not force and _thread_message_count < _MAX_THREAD_MESSAGES:
         return  # Thread is fresh enough — no navigation needed
 
     client = _get_client()
@@ -106,13 +120,15 @@ async def _ensure_fresh_chat() -> None:
         await client.new_chat()
         _thread_message_count = 0
     except Exception as e:
-        log.warning(f"new_chat() failed, retrying once: {e}")
+        log.warning("new_chat() failed (%s)", type(e).__name__)
+        if fail_closed:
+            raise FreshChatError("Fresh chat could not be verified") from e
         try:
             await asyncio.sleep(2)
             await client.new_chat()
             _thread_message_count = 0
         except Exception as e2:
-            log.error(f"new_chat() retry also failed: {e2}")
+            log.error("new_chat() retry also failed (%s)", type(e2).__name__)
             # Don't raise — continue with current thread rather than failing
             log.warning("Continuing with current thread despite new_chat failure")
 
@@ -156,6 +172,138 @@ def _get_client() -> ChatGPTClient | ClaudeClient:
 def _estimate_tokens(text: str) -> int:
     """Rough token estimate (~4 chars per token)."""
     return max(1, len(text) // 4)
+
+
+def _is_rca_request(metadata: dict[str, Any]) -> bool:
+    return metadata.get("consumer") == _RCA_CONSUMER
+
+
+def _validated_rca_request_id(metadata: dict[str, Any]) -> str:
+    request_id = metadata.get("request_id")
+    if not isinstance(request_id, str) or not request_id.startswith("rca-"):
+        raise ValueError("metadata.request_id must be rca-<UUIDv4>")
+    try:
+        parsed = uuid.UUID(request_id[4:])
+    except (ValueError, AttributeError) as exc:
+        raise ValueError("metadata.request_id must be rca-<UUIDv4>") from exc
+    if parsed.version != 4:
+        raise ValueError("metadata.request_id must be rca-<UUIDv4>")
+    if metadata.get("conversation_mode") != "fresh":
+        raise ValueError("metadata.conversation_mode must be fresh")
+    return request_id
+
+
+def _gateway_error(
+    *,
+    status_code: int,
+    code: str,
+    message: str,
+    request_id: str,
+    completion_status: str,
+    provider_outcome: str,
+    manual_action_required: bool,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "code": code,
+                "message": message,
+                "request_id": request_id,
+                "completion_status": completion_status,
+                "provider_outcome": provider_outcome,
+                "manual_action_required": manual_action_required,
+            }
+        },
+    )
+
+
+def _completion_error_response(
+    error: ChatGPTCompletionError,
+    request_id: str,
+) -> JSONResponse:
+    status = error.result.status
+    mapping = {
+        CompletionStatus.TIMEOUT: (
+            504,
+            "CHATGPT_RESPONSE_TIMEOUT",
+            "ChatGPT response completion was not verified.",
+            "unknown",
+            True,
+        ),
+        CompletionStatus.STALE: (
+            409,
+            "CHATGPT_STALE_RESPONSE",
+            "ChatGPT returned evidence for a different assistant turn.",
+            "unknown",
+            True,
+        ),
+        CompletionStatus.INCOMPLETE: (
+            422,
+            "CHATGPT_OUTPUT_INCOMPLETE",
+            "ChatGPT output was incomplete.",
+            "known_incomplete",
+            False,
+        ),
+        CompletionStatus.SELECTOR_DRIFT: (
+            503,
+            "CHATGPT_SELECTOR_DRIFT",
+            "ChatGPT completion controls could not be verified.",
+            "unknown",
+            True,
+        ),
+        CompletionStatus.OUTPUT_TOO_LARGE: (
+            502,
+            "PROVIDER_OUTPUT_TOO_LARGE",
+            "ChatGPT output exceeded the hard response budget.",
+            "known_incomplete",
+            False,
+        ),
+    }
+    http_status, code, message, outcome, manual = mapping.get(
+        status,
+        (
+            503,
+            "CHATGPT_SELECTOR_DRIFT",
+            "ChatGPT completion controls could not be verified.",
+            "unknown",
+            True,
+        ),
+    )
+    return _gateway_error(
+        status_code=http_status,
+        code=code,
+        message=message,
+        request_id=request_id,
+        completion_status=status.value,
+        provider_outcome=outcome,
+        manual_action_required=manual,
+    )
+
+
+def _provider_state_error_response(
+    error: ChatGPTProviderStateError,
+    request_id: str,
+) -> JSONResponse:
+    if error.state == "login_required":
+        return _gateway_error(
+            status_code=401,
+            code="CHATGPT_LOGIN_REQUIRED",
+            message="ChatGPT login is required.",
+            request_id=request_id,
+            completion_status="login_required",
+            provider_outcome=error.provider_outcome,
+            manual_action_required=True,
+        )
+    return _gateway_error(
+        status_code=429,
+        code="CHATGPT_RATE_LIMITED",
+        message="ChatGPT is rate limited.",
+        request_id=request_id,
+        completion_status="rate_limited",
+        provider_outcome=error.provider_outcome,
+        manual_action_required=True,
+    )
 
 
 def _extract_content_text(content) -> str:
@@ -669,7 +817,7 @@ async def create_image(
         full_prompt = " ".join(prompt_parts)
 
         log.info(
-            f"POST /v1/images/generations — prompt='{request.prompt[:80]}', "
+            f"POST /v1/images/generations — prompt={len(request.prompt)} chars, "
             f"n={request.n}, size={request.size}, response_format={request.response_format}"
         )
 
@@ -679,9 +827,12 @@ async def create_image(
         # Send to ChatGPT
         try:
             result = await client.send_message(full_prompt)
-        except Exception as e:
-            log.error(f"Provider error during image generation: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Provider error: {str(e)}")
+        except Exception as exc:
+            log.error(
+                "Provider error during image generation: %s",
+                type(exc).__name__,
+            )
+            raise HTTPException(status_code=500, detail="Provider error") from exc
 
         elapsed_ms = int((time.time() - start_time) * 1000)
 
@@ -689,16 +840,10 @@ async def create_image(
         if not result.images:
             # ChatGPT may have responded with text instead of generating an image.
             # This can happen when the model declines or gives a text description.
-            log.warning(
-                f"No images detected in response ({elapsed_ms}ms). "
-                f"ChatGPT replied: {result.message[:200]}"
-            )
+            log.warning("No images detected in response (%sms)", elapsed_ms)
             raise HTTPException(
                 status_code=422,
-                detail=(
-                    f"ChatGPT did not generate an image. "
-                    f"Model response: {result.message[:500]}"
-                ),
+                detail="ChatGPT did not generate an image.",
             )
 
         # Build image data objects
@@ -722,7 +867,7 @@ async def create_image(
                     except Exception as e:
                         log.error(f"Failed to read image file {img_info.local_path}: {e}")
                 else:
-                    log.warning(f"Image has no local_path: {img_info.url[:80]}")
+                    log.warning("Generated image has no local path")
             else:
                 # response_format == "url" → return local file path as URL
                 image_data_list.append(
@@ -750,7 +895,7 @@ async def create_image(
 @openai_router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def create_chat_completion(
     request: ChatCompletionRequest,
-) -> ChatCompletionResponse:
+) -> ChatCompletionResponse | JSONResponse:
     """
     OpenAI-compatible chat completions endpoint.
 
@@ -768,11 +913,100 @@ async def create_chat_completion(
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages array cannot be empty")
 
+    metadata = request.metadata or {}
+    rca_request = _is_rca_request(metadata)
+    request_id = str(metadata.get("request_id") or "")
+    if Config.RCA_MODE and not rca_request:
+        return _gateway_error(
+            status_code=400,
+            code="INVALID_RCA_METADATA",
+            message="RCA request metadata is required in dedicated RCA mode.",
+            request_id=request_id,
+            completion_status="not_dispatched",
+            provider_outcome="not_dispatched",
+            manual_action_required=False,
+        )
+    if rca_request:
+        try:
+            request_id = _validated_rca_request_id(metadata)
+        except ValueError:
+            return _gateway_error(
+                status_code=400,
+                code="INVALID_RCA_METADATA",
+                message="RCA request metadata is invalid.",
+                request_id=request_id,
+                completion_status="not_dispatched",
+                provider_outcome="not_dispatched",
+                manual_action_required=False,
+            )
+
+    if rca_request and request.tools:
+        return _gateway_error(
+            status_code=400,
+            code="UNSUPPORTED_PARAMETER",
+            message="tools are not supported by the RCA browser provider contract.",
+            request_id=request_id,
+            completion_status="not_dispatched",
+            provider_outcome="not_dispatched",
+            manual_action_required=False,
+        )
+
+    if rca_request and any(
+        not isinstance(message.content, str) for message in request.messages
+    ):
+        return _gateway_error(
+            status_code=400,
+            code="UNSUPPORTED_PARAMETER",
+            message="RCA browser requests support text messages only.",
+            request_id=request_id,
+            completion_status="not_dispatched",
+            provider_outcome="not_dispatched",
+            manual_action_required=False,
+        )
+
+    if request.max_tokens is not None:
+        return _gateway_error(
+            status_code=400,
+            code="UNSUPPORTED_PARAMETER",
+            message="max_tokens is not supported by the browser provider.",
+            request_id=request_id,
+            completion_status="not_dispatched",
+            provider_outcome="not_dispatched",
+            manual_action_required=False,
+        )
+
+    request_bytes = len(request.model_dump_json().encode("utf-8"))
+    if request_bytes > Config.MAX_REQUEST_BYTES:
+        return _gateway_error(
+            status_code=413,
+            code="REQUEST_TOO_LARGE",
+            message="Request body exceeded the hard input budget.",
+            request_id=request_id,
+            completion_status="not_dispatched",
+            provider_outcome="not_dispatched",
+            manual_action_required=False,
+        )
+
+    if Config.PROVIDER_DEADLINE_MS <= 0:
+        return _gateway_error(
+            status_code=500,
+            code="GATEWAY_CONFIGURATION_ERROR",
+            message="Provider deadline is not configured safely.",
+            request_id=request_id,
+            completion_status="not_dispatched",
+            provider_outcome="not_dispatched",
+            manual_action_required=True,
+        )
+    deadline = time.monotonic() + (Config.PROVIDER_DEADLINE_MS / 1000)
     client = _get_client()
 
-    metadata = request.metadata or {}
     lane_value = metadata.get("lane")
-    use_lane = Config.PROVIDER == "chatgpt" and _lane_pool is not None and lane_value is not None
+    use_lane = (
+        not rca_request
+        and Config.PROVIDER == "chatgpt"
+        and _lane_pool is not None
+        and lane_value is not None
+    )
 
     if use_lane:
         try:
@@ -837,7 +1071,24 @@ async def create_chat_completion(
             metadata={"lane": lane_number, "thread_id": result.thread_id},
         )
 
-    async with _get_lock():
+    request_lock = _get_lock()
+    try:
+        await asyncio.wait_for(
+            request_lock.acquire(),
+            timeout=max(0.001, deadline - time.monotonic()),
+        )
+    except TimeoutError:
+        return _gateway_error(
+            status_code=504,
+            code="PROVIDER_TIMEOUT",
+            message="Provider request exceeded its internal deadline.",
+            request_id=request_id,
+            completion_status="timeout",
+            provider_outcome="not_dispatched",
+            manual_action_required=True,
+        )
+
+    try:
         start_time = time.time()
 
         # ── Build the prompt ────────────────────────────────
@@ -882,22 +1133,101 @@ async def create_chat_completion(
         if all_attachment_paths:
             log.info(f"Extracted {len(image_paths)} image(s) and {len(file_paths)} file(s) from request")
 
-        # Start a fresh conversation to avoid thread exhaustion
-        await _ensure_fresh_chat()
+        # RCA uses one verified fresh chat per physical dispatch.
+        try:
+            await asyncio.wait_for(
+                _ensure_fresh_chat(
+                    force=rca_request,
+                    fail_closed=rca_request,
+                ),
+                timeout=max(0.001, deadline - time.monotonic()),
+            )
+        except TimeoutError:
+            return _gateway_error(
+                status_code=504,
+                code="PROVIDER_TIMEOUT",
+                message="Provider request exceeded its internal deadline.",
+                request_id=request_id,
+                completion_status="timeout",
+                provider_outcome="unknown",
+                manual_action_required=True,
+            )
+        except FreshChatError:
+            return _gateway_error(
+                status_code=503,
+                code="CHATGPT_FRESH_CHAT_FAILED",
+                message="A fresh ChatGPT conversation could not be verified.",
+                request_id=request_id,
+                completion_status="not_dispatched",
+                provider_outcome="not_dispatched",
+                manual_action_required=True,
+            )
 
         # ── Send to ChatGPT ────────────────────────────────
         try:
-            result = await client.send_message(
-                prompt,
-                image_paths=image_paths or None,
-                file_paths=file_paths or None,
+            send_kwargs: dict[str, Any] = {
+                "image_paths": image_paths or None,
+                "file_paths": file_paths or None,
+            }
+            if rca_request:
+                send_kwargs["request_id"] = request_id
+            remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+            if Config.PROVIDER == "chatgpt":
+                send_kwargs["deadline_ms"] = remaining_ms
+            result = await asyncio.wait_for(
+                client.send_message(prompt, **send_kwargs),
+                timeout=max(0.001, deadline - time.monotonic()),
             )
-        except Exception as e:
-            log.error(f"Provider error: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Provider error: {str(e)}")
+        except TimeoutError:
+            return _gateway_error(
+                status_code=504,
+                code="PROVIDER_TIMEOUT",
+                message="Provider request exceeded its internal deadline.",
+                request_id=request_id,
+                completion_status="timeout",
+                provider_outcome="unknown",
+                manual_action_required=True,
+            )
+        except ChatGPTCompletionError as error:
+            return _completion_error_response(error, request_id)
+        except ChatGPTProviderStateError as error:
+            return _provider_state_error_response(error, request_id)
+        except Exception:
+            log.error("Provider dispatch failed")
+            return _gateway_error(
+                status_code=503,
+                code="CHATGPT_SELECTOR_DRIFT",
+                message="ChatGPT browser dispatch failed.",
+                request_id=request_id,
+                completion_status="selector_drift",
+                provider_outcome="unknown",
+                manual_action_required=True,
+            )
 
         response_text = result.message
         elapsed_ms = int((time.time() - start_time) * 1000)
+
+        if len(response_text.encode("utf-8")) > Config.MAX_OUTPUT_BYTES:
+            return _gateway_error(
+                status_code=502,
+                code="PROVIDER_OUTPUT_TOO_LARGE",
+                message="ChatGPT output exceeded the hard response budget.",
+                request_id=request_id,
+                completion_status="output_too_large",
+                provider_outcome="known_incomplete",
+                manual_action_required=False,
+            )
+
+        if rca_request and (result.completion is None or not result.completion.verified):
+            return _gateway_error(
+                status_code=503,
+                code="CHATGPT_SELECTOR_DRIFT",
+                message="ChatGPT completion evidence is missing.",
+                request_id=request_id,
+                completion_status="selector_drift",
+                provider_outcome="unknown",
+                manual_action_required=True,
+            )
 
         # ── Detect echo (extraction grabbed sent prompt instead of reply) ──
         _echo_markers = ["[System instruction:", "tool-calling mode", "Available functions:"]
@@ -939,6 +1269,21 @@ async def create_chat_completion(
         prompt_tokens = _estimate_tokens(prompt)
         completion_tokens = _estimate_tokens(response_text or "")
 
+        response_metadata: dict[str, Any] = {}
+        if result.completion is not None:
+            response_metadata["provider_completion"] = {
+                "status": result.completion.status.value,
+                **result.completion.evidence.model_dump(mode="json"),
+            }
+        if rca_request:
+            response_metadata.update(
+                {
+                    "request_id": request_id,
+                    "thread_id": result.thread_id,
+                    "usage_source": "estimated",
+                }
+            )
+
         response = ChatCompletionResponse(
             model=request.model,
             choices=[
@@ -957,6 +1302,7 @@ async def create_chat_completion(
                 completion_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,
             ),
+            metadata=response_metadata,
         )
 
         log.info(
@@ -966,6 +1312,8 @@ async def create_chat_completion(
 
         _increment_thread_count()
         return response
+    finally:
+        request_lock.release()
 
 
 # ── Responses API (/v1/responses) ───────────────────────────────
