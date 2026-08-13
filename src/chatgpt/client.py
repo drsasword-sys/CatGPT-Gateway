@@ -17,7 +17,7 @@ from patchright.async_api import Page
 
 from src.config import Config
 from src.selectors import Selectors
-from src.browser.human import human_type, human_click, thinking_pause, random_delay
+from src.browser.human import human_type, human_click, random_delay
 from src.chatgpt.detector import (
     wait_for_response_complete,
     extract_last_response_via_copy,
@@ -53,9 +53,7 @@ class ChatGPTProviderStateError(RuntimeError):
     def __init__(self, state: str, provider_outcome: str | None = None) -> None:
         if state not in {"login_required", "rate_limited"}:
             raise ValueError("Unsupported ChatGPT provider state")
-        default_outcome = (
-            "not_dispatched" if state == "login_required" else "rejected"
-        )
+        default_outcome = "not_dispatched" if state == "login_required" else "rejected"
         outcome = provider_outcome or default_outcome
         if outcome not in {"not_dispatched", "rejected", "unknown"}:
             raise ValueError("Unsupported provider outcome")
@@ -163,7 +161,10 @@ class ChatGPTClient:
                 raise ChatGPTProviderStateError(page_error)
             raise RuntimeError(f"Page is in error state: {page_error}")
 
-        # 0.5 Count existing assistant messages so we know when a new one appears
+        # 0.5 Capture both the count and identity of the latest assistant turn.
+        # A count-only check is unsafe: stale/hidden DOM nodes can make the
+        # count grow while the composer is still unsent.  The signature is the
+        # identity proof used by the completion detector, so reuse it here.
         pre_count = await count_assistant_messages(self._page)
         pre_turn_signature = await get_latest_assistant_turn_signature(self._page)
         log.debug(f"Assistant messages before send: {pre_count}")
@@ -183,10 +184,14 @@ class ChatGPTClient:
         input_selector = await self._find_selector(Selectors.CHAT_INPUT, "chat input")
         if not input_selector:
             # An overlay may have blocked it — dismiss and retry
-            log.info("Chat input not found on first try, dismissing overlays and retrying...")
+            log.info(
+                "Chat input not found on first try, dismissing overlays and retrying..."
+            )
             await self._dismiss_overlays()
             await asyncio.sleep(1)
-            input_selector = await self._find_selector(Selectors.CHAT_INPUT, "chat input")
+            input_selector = await self._find_selector(
+                Selectors.CHAT_INPUT, "chat input"
+            )
         if not input_selector:
             raise RuntimeError("Could not find chat input element")
 
@@ -198,17 +203,33 @@ class ChatGPTClient:
 
         # 4. Poll briefly for auto-submit (execCommand can trigger
         #    f/conversation automatically in the current frontend).
-        #    If a new assistant turn appeared, skip the send button click.
+        #    Only skip the send button when a different assistant-turn
+        #    signature is visible.  A count increase without that identity
+        #    proof is stale DOM evidence, so fall through to an explicit send.
         auto_submitted = False
         for _ in range(6):  # poll up to ~3s in 0.5s intervals
             await asyncio.sleep(0.5)
-            post_count = await count_assistant_messages(self._page)
-            if post_count > pre_count:
+            post_turn_signature = await get_latest_assistant_turn_signature(self._page)
+            network_status = (
+                self._network_recorder.stream_status
+                if self._network_recorder is not None
+                else NetworkStreamStatus.UNAVAILABLE
+            )
+            network_request_started = (
+                network_status is not NetworkStreamStatus.UNAVAILABLE
+            )
+            if network_request_started or (
+                pre_turn_signature is not None
+                and post_turn_signature is not None
+                and post_turn_signature != pre_turn_signature
+            ):
                 auto_submitted = True
                 break
 
         if auto_submitted:
-            log.info("ChatGPT auto-submitted after text entry — skipping send button click")
+            log.info(
+                "ChatGPT auto-submitted after text entry — skipping send button click"
+            )
         else:
             # No auto-submit — click the send button
             log.info("No auto-submit detected, clicking send button")
@@ -286,7 +307,9 @@ class ChatGPTClient:
             # If we only captured a transient status (e.g. "Pro thinking"),
             # keep waiting and retry extraction on the same new turn.
             if is_incomplete_response_text(response_text):
-                log.warning("Extracted text looks incomplete/transient; retrying for final answer")
+                log.warning(
+                    "Extracted text looks incomplete/transient; retrying for final answer"
+                )
                 for attempt in range(1, 3):
                     await asyncio.sleep(2)
                     await wait_for_response_complete(
@@ -457,7 +480,9 @@ class ChatGPTClient:
                 if attempt < max_attempts:
                     await asyncio.sleep(attempt * 3)
                     continue
-                raise RuntimeError(f"Page error persists after {max_attempts} attempts: {page_error}")
+                raise RuntimeError(
+                    f"Page error persists after {max_attempts} attempts: {page_error}"
+                )
 
             log.info("New chat started (page.goto)")
             await self._verify_fresh_chat()
@@ -508,7 +533,9 @@ class ChatGPTClient:
         """Wait for the chat input to become visible and interactive."""
         for selector in Selectors.CHAT_INPUT:
             try:
-                await self._page.wait_for_selector(selector, timeout=10000, state="visible")
+                await self._page.wait_for_selector(
+                    selector, timeout=10000, state="visible"
+                )
                 log.debug("Chat input ready")
                 # Brief settle for React handlers to attach
                 await asyncio.sleep(0.5)
@@ -606,11 +633,13 @@ class ChatGPTClient:
                     title = (await el.inner_text()).strip()
                     match = re.search(r"/c/([a-f0-9-]+)", href)
                     if match:
-                        threads.append({
-                            "id": match.group(1),
-                            "title": title,
-                            "url": f"{Config.CHATGPT_URL}{href}",
-                        })
+                        threads.append(
+                            {
+                                "id": match.group(1),
+                                "title": title,
+                                "url": f"{Config.CHATGPT_URL}{href}",
+                            }
+                        )
                 if threads:
                     break
             except Exception as e:
@@ -621,14 +650,17 @@ class ChatGPTClient:
 
     # ── Private Helpers ─────────────────────────────────────────
 
-    async def _extract_image_turn_text(self, previous_turn_signature: str | None = None) -> str:
+    async def _extract_image_turn_text(
+        self, previous_turn_signature: str | None = None
+    ) -> str:
         """
         Extract any text content from the latest turn (for image responses).
 
         Image turns may contain a title/description like:
         "Creating image • Adorable orange tabby kitten close-up"
         """
-        text = await self._page.evaluate("""
+        text = await self._page.evaluate(
+            """
             (previousSignature) => {
                 const turns = document.querySelectorAll('section[data-testid^="conversation-turn-"]');
                 if (turns.length === 0) return '';
@@ -674,7 +706,9 @@ class ChatGPTClient:
                 // Strip the "ChatGPT said:" prefix
                 return full.replace(/^ChatGPT said:\\s*/i, '').trim();
             }
-        """, previous_turn_signature)
+        """,
+            previous_turn_signature,
+        )
         return text or ""
 
     async def _find_selector(self, selectors: list[str], name: str) -> str | None:
@@ -799,7 +833,9 @@ class ChatGPTClient:
                 log.warning("Send button is not visible")
                 return False
             if btn_state.get("disabled") or btn_state.get("ariaDisabled") == "true":
-                log.warning("Send button is disabled — text may not have been inserted properly")
+                log.warning(
+                    "Send button is disabled — text may not have been inserted properly"
+                )
                 return False
 
         selector = await self._find_selector(Selectors.SEND_BUTTON, "send button")

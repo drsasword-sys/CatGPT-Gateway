@@ -108,6 +108,70 @@ class ChatGptSendGuardTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_stale_assistant_count_does_not_skip_explicit_send(self) -> None:
+        async def scenario() -> None:
+            client = self._client_ready_to_send()
+            timeout = CompletionResult(status=CompletionStatus.TIMEOUT)
+            with (
+                patch("src.chatgpt.client.random_delay", new=AsyncMock()),
+                patch("src.chatgpt.client.human_type", new=AsyncMock()),
+                patch(
+                    "src.chatgpt.client.count_assistant_messages",
+                    new=AsyncMock(side_effect=[0, 1]),
+                ),
+                patch(
+                    "src.chatgpt.client.get_latest_assistant_turn_signature",
+                    new=AsyncMock(return_value="1:old-turn"),
+                ),
+                patch(
+                    "src.chatgpt.client.wait_for_response_complete",
+                    new=AsyncMock(return_value=timeout),
+                ),
+                patch("src.chatgpt.client.asyncio.sleep", new=AsyncMock()),
+            ):
+                with self.assertRaises(ChatGPTCompletionError):
+                    await client.send_message("synthetic stale-count prompt")
+
+            client._click_send.assert_awaited_once()
+
+        asyncio.run(scenario())
+
+    def test_network_auto_submit_prevents_duplicate_send_on_fresh_chat(self) -> None:
+        async def scenario() -> None:
+            client = self._client_ready_to_send()
+
+            class AutoSubmittedRecorder:
+                stream_status = NetworkStreamStatus.OPEN
+
+                def arm(self, _request_id: str) -> None:
+                    return None
+
+            client._network_recorder = AutoSubmittedRecorder()
+            timeout = CompletionResult(status=CompletionStatus.TIMEOUT)
+            with (
+                patch("src.chatgpt.client.random_delay", new=AsyncMock()),
+                patch("src.chatgpt.client.human_type", new=AsyncMock()),
+                patch(
+                    "src.chatgpt.client.count_assistant_messages",
+                    new=AsyncMock(return_value=0),
+                ),
+                patch(
+                    "src.chatgpt.client.get_latest_assistant_turn_signature",
+                    new=AsyncMock(return_value=None),
+                ),
+                patch(
+                    "src.chatgpt.client.wait_for_response_complete",
+                    new=AsyncMock(return_value=timeout),
+                ),
+                patch("src.chatgpt.client.asyncio.sleep", new=AsyncMock()),
+            ):
+                with self.assertRaises(ChatGPTCompletionError):
+                    await client.send_message("synthetic fresh auto-submit prompt")
+
+            client._click_send.assert_not_awaited()
+
+        asyncio.run(scenario())
+
     def test_output_budget_breach_stops_visible_generation(self) -> None:
         async def scenario() -> None:
             client = self._client_ready_to_send()
@@ -184,7 +248,10 @@ class ChatGptSendGuardTests(unittest.TestCase):
 
             client._verify_fresh_chat.assert_awaited_once()
             self.assertTrue(
-                any("window.location.href" in call.args[0] for call in page.evaluate.call_args_list)
+                any(
+                    "window.location.href" in call.args[0]
+                    for call in page.evaluate.call_args_list
+                )
             )
 
         asyncio.run(scenario())
@@ -199,11 +266,13 @@ class ChatGptSendGuardTests(unittest.TestCase):
             script = client._page.evaluate.call_args.args[0]
             self.assertIn('data-message-author-role="assistant"', script)
             self.assertIn('data-turn="assistant"', script)
-            self.assertIn('article', script)
+            self.assertIn("article", script)
 
         asyncio.run(scenario())
 
-    def test_detector_prefers_role_marked_turns_when_legacy_sections_are_empty(self) -> None:
+    def test_detector_prefers_role_marked_turns_when_legacy_sections_are_empty(
+        self,
+    ) -> None:
         async def scenario() -> None:
             page = AsyncMock()
             page.evaluate.return_value = {
