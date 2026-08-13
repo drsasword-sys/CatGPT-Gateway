@@ -31,6 +31,39 @@ log = setup_logging("detector")
 _monotonic = time.monotonic
 
 
+# ChatGPT has shipped both section-based turns and role-marked message nodes.
+# Keep the discovery policy in one place so completion, counting and extraction
+# cannot drift apart when the web UI changes again. Role nodes are preferred;
+# the legacy section selector remains the fallback for older conversations.
+_CONVERSATION_TURNS_JS = """
+const legacyTurns = Array.from(
+    document.querySelectorAll('section[data-testid^="conversation-turn-"]')
+);
+const roleTurns = Array.from(document.querySelectorAll(
+    '[data-message-author-role="user"], [data-message-author-role="assistant"]'
+));
+const turns = roleTurns.length > 0 ? roleTurns : legacyTurns;
+const getTurnRoot = (turn) => (
+    turn.closest(
+        'section[data-testid^="conversation-turn-"], [data-testid^="conversation-turn-"]'
+    ) || turn
+);
+const getCopyButton = (turn) => (
+    turn.querySelector(
+        'button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"], button[aria-label="Copy"]'
+    ) || getTurnRoot(turn).querySelector(
+        'button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"], button[aria-label="Copy"]'
+    )
+);
+"""
+
+
+def _conversation_script(body: str, *, argument: bool = False) -> str:
+    """Build one DOM probe with the shared conversation discovery policy."""
+    prefix = "(previousSignature) => {" if argument else "() => {"
+    return f"{prefix}\n{_CONVERSATION_TURNS_JS}\n{body}\n}}"
+
+
 def normalize_assistant_text(text: str | None) -> str:
     """Normalize extracted assistant text for validation and comparisons."""
     cleaned = (text or "").strip()
@@ -88,21 +121,23 @@ async def _dump_all_turns(page: Page) -> list[dict]:
     """Dump info about all conversation turns for debugging."""
     try:
         turns = await page.evaluate(
-            """
-            () => {
-                const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
+            _conversation_script(
+                """
                 return turns.map((turn, idx) => {
-                    const role = turn.getAttribute('data-turn') || 'unknown';
+                    const root = getTurnRoot(turn);
+                    const role = turn.getAttribute('data-message-author-role') ||
+                        turn.getAttribute('data-turn') ||
+                        root.getAttribute('data-turn') ||
+                        'unknown';
                     const textLength = (turn.innerText || '').trim().length;
-                    const buttons = turn.querySelectorAll('button').length;
-                    const copyBtn = Boolean(turn.querySelector(
-                        'button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"], button[aria-label="Copy"]'
-                    ));
-                    const hasArticle = Boolean(turn.querySelector('article'));
+                    const buttons = root.querySelectorAll('button').length;
+                    const copyBtn = Boolean(getCopyButton(turn));
+                    const hasArticle = Boolean(root.querySelector('article')) ||
+                        root.matches('article');
                     return { idx, role, textLength, buttons, copyBtn, hasArticle };
                 });
-            }
-            """
+                """
+            )
         )
         return turns or []
     except Exception as e:
@@ -118,29 +153,34 @@ async def _latest_assistant_turn_snapshot(page: Page) -> dict:
     where stable-id is best-effort from DOM attributes.
     """
     snapshot = await page.evaluate(
-        """
-        () => {
-            const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
-
+        _conversation_script(
+            """
             for (let idx = turns.length - 1; idx >= 0; idx--) {
                 const turn = turns[idx];
-                const turnRole = turn.getAttribute('data-turn');
+                const root = getTurnRoot(turn);
+                const turnRole = turn.getAttribute('data-message-author-role') ||
+                    turn.getAttribute('data-turn') ||
+                    root.getAttribute('data-turn');
                 const hasAssistantRole = turnRole === 'assistant' ||
-                    Boolean(turn.querySelector('[data-message-author-role="assistant"]'));
+                    Boolean(turn.querySelector('[data-message-author-role="assistant"]')) ||
+                    Boolean(root.querySelector('[data-message-author-role="assistant"]'));
                 if (!hasAssistantRole) continue;
 
                 const stableId =
+                    turn.getAttribute('data-message-id') ||
                     turn.getAttribute('data-turn-id') ||
                     turn.getAttribute('data-testid') ||
                     turn.id ||
+                    root.getAttribute('data-message-id') ||
+                    root.getAttribute('data-turn-id') ||
+                    root.getAttribute('data-testid') ||
+                    root.id ||
                     '';
 
-                const hasCopyButton = Boolean(
-                    turn.querySelector('button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"], button[aria-label="Copy"]')
-                );
+                const hasCopyButton = Boolean(getCopyButton(turn));
 
                 const hasImage = Boolean(
-                    turn.querySelector('img[alt="Generated image"], div[id^="image-"] img, div[id^="image-"]')
+                    root.querySelector('img[alt="Generated image"], div[id^="image-"] img, div[id^="image-"]')
                 );
 
                 const text = (turn.innerText || '').trim();
@@ -163,8 +203,8 @@ async def _latest_assistant_turn_snapshot(page: Page) -> dict:
                 hasImage: false,
                 text: '',
             };
-        }
-        """
+            """,
+        )
     )
 
     if not isinstance(snapshot, dict):
@@ -185,20 +225,22 @@ async def get_latest_assistant_turn_signature(page: Page) -> str | None:
 async def count_assistant_messages(page: Page) -> int:
     """Count assistant turns (article based, newest-UI friendly)."""
     count = await page.evaluate(
-        """
-        () => {
-            const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
-
+        _conversation_script(
+            """
             let total = 0;
             for (const turn of turns) {
-                const turnRole = turn.getAttribute('data-turn');
+                const root = getTurnRoot(turn);
+                const turnRole = turn.getAttribute('data-message-author-role') ||
+                    turn.getAttribute('data-turn') ||
+                    root.getAttribute('data-turn');
                 const hasAssistantRole = turnRole === 'assistant' ||
-                    Boolean(turn.querySelector('[data-message-author-role="assistant"]'));
+                    Boolean(turn.querySelector('[data-message-author-role="assistant"]')) ||
+                    Boolean(root.querySelector('[data-message-author-role="assistant"]'));
                 if (hasAssistantRole) total++;
             }
             return total;
-        }
-        """
+            """,
+        )
     )
     return int(count or 0)
 
@@ -216,24 +258,24 @@ async def _detect_image_in_latest_turn(page: Page, previous_turn_signature: str 
 async def _count_copy_buttons(page: Page) -> int:
     """Count assistant turns that currently expose a copy button."""
     count = await page.evaluate(
-        """
-        () => {
-            const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
-
+        _conversation_script(
+            """
             let total = 0;
             for (const turn of turns) {
-                const turnRole = turn.getAttribute('data-turn');
+                const root = getTurnRoot(turn);
+                const turnRole = turn.getAttribute('data-message-author-role') ||
+                    turn.getAttribute('data-turn') ||
+                    root.getAttribute('data-turn');
                 const hasAssistantRole = turnRole === 'assistant' ||
-                    Boolean(turn.querySelector('[data-message-author-role="assistant"]'));
+                    Boolean(turn.querySelector('[data-message-author-role="assistant"]')) ||
+                    Boolean(root.querySelector('[data-message-author-role="assistant"]'));
                 if (!hasAssistantRole) continue;
-                const hasCopyButton = turn.querySelector(
-                    'button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"], button[aria-label="Copy"]'
-                );
+                const hasCopyButton = getCopyButton(turn);
                 if (hasCopyButton) total++;
             }
             return total;
-        }
-        """
+            """,
+        )
     )
     return int(count or 0)
 
@@ -785,21 +827,28 @@ async def extract_last_response_via_copy(
         await page.evaluate("navigator.clipboard.writeText('').catch(() => {})")
 
         click_result = await page.evaluate(
-            """
-            (previousSignature) => {
-                const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
-
+            _conversation_script(
+                """
                 for (let idx = turns.length - 1; idx >= 0; idx--) {
                     const turn = turns[idx];
-                    const turnRole = turn.getAttribute('data-turn');
+                    const root = getTurnRoot(turn);
+                    const turnRole = turn.getAttribute('data-message-author-role') ||
+                        turn.getAttribute('data-turn') ||
+                        root.getAttribute('data-turn');
                     const hasAssistantRole = turnRole === 'assistant' ||
-                        Boolean(turn.querySelector('[data-message-author-role="assistant"]'));
+                        Boolean(turn.querySelector('[data-message-author-role="assistant"]')) ||
+                        Boolean(root.querySelector('[data-message-author-role="assistant"]'));
                     if (!hasAssistantRole) continue;
 
                     const stableId =
+                        turn.getAttribute('data-message-id') ||
                         turn.getAttribute('data-turn-id') ||
                         turn.getAttribute('data-testid') ||
                         turn.id ||
+                        root.getAttribute('data-message-id') ||
+                        root.getAttribute('data-turn-id') ||
+                        root.getAttribute('data-testid') ||
+                        root.id ||
                         '';
                     const signature = `${idx}:${stableId}`;
 
@@ -807,9 +856,7 @@ async def extract_last_response_via_copy(
                         return { clicked: false, reason: 'stale-turn', signature };
                     }
 
-                    const btn = turn.querySelector(
-                        'button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"], button[aria-label="Copy"]'
-                    );
+                    const btn = getCopyButton(turn);
                     if (!btn) {
                         return { clicked: false, reason: 'no-copy-button', signature };
                     }
@@ -819,8 +866,9 @@ async def extract_last_response_via_copy(
                 }
 
                 return { clicked: false, reason: 'no-assistant-turn', signature: null };
-            }
-            """,
+                """,
+                argument=True,
+            ),
             previous_turn_signature,
         )
 
@@ -851,21 +899,28 @@ async def _extract_via_dom(
 ) -> str:
     """Fallback extraction: innerText from latest assistant turn only."""
     text = await page.evaluate(
-        """
-        (previousSignature) => {
-            const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
-
+        _conversation_script(
+            """
             for (let idx = turns.length - 1; idx >= 0; idx--) {
                 const turn = turns[idx];
-                const turnRole = turn.getAttribute('data-turn');
+                const root = getTurnRoot(turn);
+                const turnRole = turn.getAttribute('data-message-author-role') ||
+                    turn.getAttribute('data-turn') ||
+                    root.getAttribute('data-turn');
                 const hasAssistantRole = turnRole === 'assistant' ||
-                    Boolean(turn.querySelector('[data-message-author-role="assistant"]'));
+                    Boolean(turn.querySelector('[data-message-author-role="assistant"]')) ||
+                    Boolean(root.querySelector('[data-message-author-role="assistant"]'));
                 if (!hasAssistantRole) continue;
 
                 const stableId =
+                    turn.getAttribute('data-message-id') ||
                     turn.getAttribute('data-turn-id') ||
                     turn.getAttribute('data-testid') ||
                     turn.id ||
+                    root.getAttribute('data-message-id') ||
+                    root.getAttribute('data-turn-id') ||
+                    root.getAttribute('data-testid') ||
+                    root.id ||
                     '';
                 const signature = `${idx}:${stableId}`;
 
@@ -877,8 +932,9 @@ async def _extract_via_dom(
             }
 
             return '';
-        }
-        """,
+            """,
+            argument=True,
+        ),
         previous_turn_signature,
     )
 

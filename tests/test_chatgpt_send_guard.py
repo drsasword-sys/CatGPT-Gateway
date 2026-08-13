@@ -203,6 +203,29 @@ class ChatGptSendGuardTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_detector_prefers_role_marked_turns_when_legacy_sections_are_empty(self) -> None:
+        async def scenario() -> None:
+            page = AsyncMock()
+            page.evaluate.return_value = {
+                "found": True,
+                "index": 1,
+                "signature": "1:role-message-id",
+                "hasCopyButton": True,
+                "hasImage": False,
+                "text": "Complete role-marked response",
+            }
+
+            snapshot = await detector._latest_assistant_turn_snapshot(page)
+
+            self.assertEqual("1:role-message-id", snapshot["signature"])
+            script = page.evaluate.call_args.args[0]
+            self.assertIn("const roleTurns = Array.from", script)
+            self.assertIn('[data-message-author-role="user"]', script)
+            self.assertIn("roleTurns.length > 0 ? roleTurns : legacyTurns", script)
+            self.assertIn("getCopyButton", script)
+
+        asyncio.run(scenario())
+
     def test_extracted_turn_must_match_completion_evidence(self) -> None:
         async def scenario() -> None:
             client = self._client_ready_to_send()
