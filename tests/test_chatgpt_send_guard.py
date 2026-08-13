@@ -156,6 +156,53 @@ class ChatGptSendGuardTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_new_chat_does_not_skip_when_legacy_dom_hides_message_roles(self) -> None:
+        async def scenario() -> None:
+            client = object.__new__(ChatGPTClient)
+            page = AsyncMock()
+            page.url = "https://chatgpt.com/"
+
+            async def evaluate(script: str, *args):
+                # Simulate the UI drift seen in the live canary: the old
+                # conversation-turn selector is empty, while role markers
+                # still expose the existing conversation.
+                if "window.location.href" in script:
+                    return None
+                if "data-message-author-role" in script:
+                    return 1
+                if "conversation-turn-" in script:
+                    return 0
+                return None
+
+            page.evaluate.side_effect = evaluate
+            page.query_selector.return_value = None
+            client._page = page
+            client._detect_page_error = AsyncMock(return_value=None)
+            client._verify_fresh_chat = AsyncMock()
+
+            await client.new_chat()
+
+            client._verify_fresh_chat.assert_awaited_once()
+            self.assertTrue(
+                any("window.location.href" in call.args[0] for call in page.evaluate.call_args_list)
+            )
+
+        asyncio.run(scenario())
+
+    def test_conversation_marker_count_uses_role_fallbacks(self) -> None:
+        async def scenario() -> None:
+            client = object.__new__(ChatGPTClient)
+            client._page = AsyncMock()
+            client._page.evaluate.return_value = 2
+
+            self.assertEqual(2, await client._conversation_marker_count())
+            script = client._page.evaluate.call_args.args[0]
+            self.assertIn('data-message-author-role="assistant"', script)
+            self.assertIn('data-turn="assistant"', script)
+            self.assertIn('article', script)
+
+        asyncio.run(scenario())
+
     def test_extracted_turn_must_match_completion_evidence(self) -> None:
         async def scenario() -> None:
             client = self._client_ready_to_send()

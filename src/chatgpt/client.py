@@ -394,9 +394,7 @@ class ChatGPTClient:
         # Already on a fresh chat — nothing to do
         if "chatgpt.com" in self._page.url:
             try:
-                turn_count = await self._page.evaluate(
-                    "document.querySelectorAll('[data-testid^=\"conversation-turn-\"]').length"
-                )
+                turn_count = await self._conversation_marker_count()
                 if turn_count == 0:
                     log.info("Already on a fresh chat — skipping navigation")
                     await self._verify_fresh_chat()
@@ -414,9 +412,7 @@ class ChatGPTClient:
                     await asyncio.sleep(1)
                     # Verify we're on a fresh chat
                     try:
-                        turn_count = await self._page.evaluate(
-                            "document.querySelectorAll('[data-testid^=\"conversation-turn-\"]').length"
-                        )
+                        turn_count = await self._conversation_marker_count()
                         if turn_count == 0:
                             await self._verify_fresh_chat()
                             return
@@ -470,14 +466,43 @@ class ChatGPTClient:
     async def _verify_fresh_chat(self) -> None:
         """Require zero conversation turns and a ready composer."""
         try:
-            turn_count = await self._page.evaluate(
-                "document.querySelectorAll('[data-testid^=\"conversation-turn-\"]').length"
-            )
+            turn_count = await self._conversation_marker_count()
         except Exception as exc:
             raise RuntimeError("Fresh chat state could not be inspected") from exc
         if turn_count != 0:
             raise RuntimeError("ChatGPT conversation is not fresh")
         await self._wait_for_chat_input()
+
+    async def _conversation_marker_count(self) -> int:
+        """Count visible conversation markers across ChatGPT UI generations.
+
+        ChatGPT has changed the element/tag carrying ``conversation-turn``
+        several times.  Treating the legacy selector as authoritative can
+        mistake an existing conversation for the landing page and leave the
+        prompt in a stale composer.  Role markers are preferred, with turn
+        containers and articles as compatibility fallbacks; this is only a
+        non-zero freshness signal, not a response extractor.
+        """
+        count = await self._page.evaluate(
+            """
+            () => {
+                const selectors = [
+                    '[data-message-author-role="user"]',
+                    '[data-message-author-role="assistant"]',
+                    '[data-turn="user"]',
+                    '[data-turn="assistant"]',
+                    '[data-testid^="conversation-turn-"]',
+                    'article',
+                ];
+                let total = 0;
+                for (const selector of selectors) {
+                    total = Math.max(total, document.querySelectorAll(selector).length);
+                }
+                return total;
+            }
+            """
+        )
+        return int(count or 0)
 
     async def _wait_for_chat_input(self) -> None:
         """Wait for the chat input to become visible and interactive."""
