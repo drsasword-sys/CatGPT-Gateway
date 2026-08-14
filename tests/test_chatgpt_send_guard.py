@@ -817,6 +817,95 @@ class ChatGptSendGuardTests(unittest.TestCase):
         result = asyncio.run(scenario())
         self.assertEqual(CompletionStatus.INCOMPLETE, result.status)
 
+    def test_revalidation_accepts_copy_markdown_for_same_dom_turn(self) -> None:
+        async def scenario():
+            dom_text = "Chương 1\nNội dung đã dịch xong."
+            copied_markdown = "**Chương 1**\n\nNội dung đã dịch xong."
+            complete = CompletionResult(
+                status=CompletionStatus.COMPLETE,
+                evidence=CompletionEvidence(
+                    evidence="new_turn_final_action_stop_absent_text_stable",
+                    turn_signature="2:expected-turn",
+                    stable_samples=3,
+                    stable_for_ms=3000,
+                    output_chars=len(dom_text),
+                    output_sha256=self._sha256(dom_text),
+                    final_action_present=True,
+                    stop_button_visible=False,
+                ),
+            )
+            with (
+                patch.object(
+                    detector,
+                    "_latest_assistant_turn_snapshot",
+                    new=AsyncMock(
+                        return_value={
+                            "signature": "2:expected-turn",
+                            "hasCopyButton": True,
+                            "hasImage": False,
+                            "text": dom_text,
+                        }
+                    ),
+                ),
+                patch.object(
+                    detector,
+                    "_is_stop_button_visible",
+                    new=AsyncMock(return_value=False),
+                ),
+            ):
+                return await detector.revalidate_completion_evidence(
+                    AsyncMock(),
+                    complete,
+                    copied_markdown,
+                )
+
+        result = asyncio.run(scenario())
+        self.assertEqual(CompletionStatus.COMPLETE, result.status)
+
+    def test_revalidation_rejects_copy_text_from_another_turn(self) -> None:
+        async def scenario():
+            dom_text = "Chương 1\nNội dung đúng."
+            complete = CompletionResult(
+                status=CompletionStatus.COMPLETE,
+                evidence=CompletionEvidence(
+                    evidence="new_turn_final_action_stop_absent_text_stable",
+                    turn_signature="2:expected-turn",
+                    stable_samples=3,
+                    stable_for_ms=3000,
+                    output_chars=len(dom_text),
+                    output_sha256=self._sha256(dom_text),
+                    final_action_present=True,
+                    stop_button_visible=False,
+                ),
+            )
+            with (
+                patch.object(
+                    detector,
+                    "_latest_assistant_turn_snapshot",
+                    new=AsyncMock(
+                        return_value={
+                            "signature": "2:expected-turn",
+                            "hasCopyButton": True,
+                            "hasImage": False,
+                            "text": dom_text,
+                        }
+                    ),
+                ),
+                patch.object(
+                    detector,
+                    "_is_stop_button_visible",
+                    new=AsyncMock(return_value=False),
+                ),
+            ):
+                return await detector.revalidate_completion_evidence(
+                    AsyncMock(),
+                    complete,
+                    "Chương khác\nNội dung sai.",
+                )
+
+        result = asyncio.run(scenario())
+        self.assertEqual(CompletionStatus.INCOMPLETE, result.status)
+
     def test_complete_status_without_full_evidence_is_not_verified(self) -> None:
         result = CompletionResult(status=CompletionStatus.COMPLETE)
         self.assertFalse(result.verified)

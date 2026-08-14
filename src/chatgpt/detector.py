@@ -77,6 +77,22 @@ def _assistant_text_sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _comparison_text(text: str | None) -> str:
+    """Canonicalize DOM text and Copy-button Markdown for safe comparison.
+
+    ChatGPT renders Markdown in the DOM but its Copy button returns the source
+    Markdown.  The two representations can describe the same assistant turn
+    while differing in headings, emphasis, links, and list markers.
+    """
+    cleaned = normalize_assistant_text(text)
+    cleaned = re.sub(r"!\[([^\]]*)\]\([^\n)]*\)", r"\1", cleaned)
+    cleaned = re.sub(r"\[([^\]]+)\]\([^\n)]*\)", r"\1", cleaned)
+    cleaned = re.sub(r"(?m)^\s*```[^\n]*$", "", cleaned)
+    cleaned = re.sub(r"(?m)^\s{0,3}(?:#{1,6}\s+|>\s?|[-+*•]\s+|\d+[.)]\s+)", "", cleaned)
+    cleaned = re.sub(r"(?:\*{1,3}|_{1,3}|~~|`{1,3})", "", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def is_incomplete_response_text(text: str | None) -> bool:
     """
     Heuristic: true when text looks like transient "thinking/searching" UI status.
@@ -515,7 +531,7 @@ async def revalidate_completion_evidence(
         snapshot.get("text") if isinstance(snapshot.get("text"), str) else ""
     )
     extracted = normalize_assistant_text(extracted_text)
-    extracted_hash = _assistant_text_sha256(extracted) if extracted else None
+    dom_hash = _assistant_text_sha256(dom_text) if dom_text else None
     final_action_present = bool(
         snapshot.get("hasCopyButton") or snapshot.get("hasImage")
     )
@@ -532,9 +548,12 @@ async def revalidate_completion_evidence(
         not final_action_present
         or not extracted
         or is_incomplete_response_text(extracted)
-        or dom_text != extracted
-        or extracted_hash != completion.evidence.output_sha256
-        or len(extracted) != completion.evidence.output_chars
+        # First prove that the same DOM text observed during the stable window
+        # is still present.  Then compare the Copy-button Markdown with that
+        # DOM text after removing presentation-only Markdown differences.
+        or dom_hash != completion.evidence.output_sha256
+        or len(dom_text) != completion.evidence.output_chars
+        or _comparison_text(dom_text) != _comparison_text(extracted)
         or completion.evidence.stable_samples < 3
         or completion.evidence.stable_for_ms < Config.COMPLETION_STABLE_MS
     ):
